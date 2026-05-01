@@ -55,9 +55,11 @@ jobs:
         shell: pwsh
         run: |
           $output = node dist/cli.js status 2>&1
-          if ($LASTEXITCODE -eq 0) {
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -eq 0) {
             Write-Error "Expected prwr status to fail when no supervisor is running."
           }
           if ($output -notmatch "prwr supervisor is not running") {
             Write-Error "Unexpected status output: $output"
           }
+          exit 0
