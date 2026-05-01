@@ -37,7 +37,7 @@ If `pnpm` is unavailable in an automation environment, configure that environmen
 - `dist/` is generated and ignored by Git.
 - The npm package publishes `dist`, `README.md`, `LICENSE`, and `package.json`.
 - `prepack` rebuilds `dist` before packaging.
-- npm publishing uses GitHub Actions trusted publishing from `.github/workflows/publish.yml`.
+- npm publishing is manual with `npm publish --access public`.
 - Do not add npm tokens to the repo or GitHub Actions secrets for publishing.
 
 ## Before Changing Process Behavior

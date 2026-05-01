@@ -158,14 +158,12 @@ For the next release:
 1. Update the version in `package.json`.
 2. Run `pnpm run lint`, `pnpm run build`, `pnpm test`, and `pnpm run pack:check`.
 3. Commit the version change.
-4. Tag the commit with the same version, for example `git tag -a v0.1.1 -m "v0.1.1"`.
-5. Push the commit and tag.
+4. Push the commit and wait for CI to pass.
+5. Publish from a local terminal with `npm publish --access public`.
+6. Tag the commit with the same version, for example `git tag -a v0.1.1 -m "v0.1.1"`.
+7. Push the tag and create a GitHub release.
 
-The `Publish` GitHub Actions workflow runs on `v*.*.*` tags and publishes with npm trusted publishing. Before the first automated publish, configure npm's trusted publisher for this package to use:
-
-- GitHub owner: `puckzxz`
-- Repository: `prwr`
-- Workflow: `publish.yml`
+CI runs on pushes and tags. npm publishing is intentionally manual for now.
 
 ## Limitations
 
