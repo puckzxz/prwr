@@ -2,10 +2,17 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import net from "node:net";
 import path from "node:path";
 import { isPidAlive } from "./kill-tree.js";
-import type { ControlCommand, ControlResponse, SupervisorStateFile } from "./types.js";
+import { DEFAULT_MAX_CONTROL_RESPONSE_BYTES } from "./control-server.js";
+import type {
+  ControlCommand,
+  ControlResponse,
+  SupervisorIdentity,
+  SupervisorStateFile
+} from "./types.js";
 
 const RUNTIME_DIR_NAME = ".prwr";
 const STATE_FILE_NAME = "supervisor.json";
+const DEFAULT_CONTROL_CLIENT_TIMEOUT_MS = 5000;
 
 export function runtimeDir(projectRoot: string): string {
   return path.join(projectRoot, RUNTIME_DIR_NAME);
@@ -57,37 +64,82 @@ function isValidState(value: SupervisorStateFile): boolean {
     typeof value.port === "number" &&
     Number.isInteger(value.port) &&
     value.port > 0 &&
+    typeof value.token === "string" &&
+    value.token.length > 0 &&
     typeof value.startedAt === "string"
   );
+}
+
+export async function readVerifiedSupervisorState(
+  projectRoot: string
+): Promise<SupervisorStateFile | null> {
+  const state = readSupervisorState(projectRoot);
+  if (!state) {
+    return null;
+  }
+
+  const response = await sendControlCommandToState(projectRoot, state, { type: "identity" }, false);
+  if (!response.ok || !isSupervisorIdentity(response.data) || !identityMatchesState(response.data, state)) {
+    removeSupervisorState(projectRoot);
+    return null;
+  }
+
+  return state;
 }
 
 export async function sendControlCommand(
   projectRoot: string,
   command: ControlCommand
 ): Promise<ControlResponse> {
-  const state = readSupervisorState(projectRoot);
+  const state = await readVerifiedSupervisorState(projectRoot);
   if (!state) {
     return { ok: false, error: "prwr supervisor is not running for this project." };
   }
 
+  return sendControlCommandToState(projectRoot, state, command, true);
+}
+
+async function sendControlCommandToState(
+  projectRoot: string,
+  state: SupervisorStateFile,
+  command: ControlCommand,
+  removeStateOnFailure: boolean
+): Promise<ControlResponse> {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host: "127.0.0.1", port: state.port });
     let response = "";
+    let responseBytes = 0;
     let settled = false;
 
-    const finish = (value: ControlResponse) => {
+    const finish = (value: ControlResponse, removeState = false) => {
       if (!settled) {
         settled = true;
+        socket.setTimeout(0);
+        if (removeState && removeStateOnFailure) {
+          removeSupervisorState(projectRoot);
+        }
         resolve(value);
       }
     };
 
     socket.setEncoding("utf8");
+    socket.setTimeout(DEFAULT_CONTROL_CLIENT_TIMEOUT_MS, () => {
+      socket.destroy();
+      finish({ ok: false, error: "Timed out waiting for prwr supervisor response." }, true);
+    });
+
     socket.on("connect", () => {
-      socket.end(JSON.stringify(command));
+      socket.end(JSON.stringify({ token: state.token, command }));
     });
 
     socket.on("data", (chunk) => {
+      responseBytes += Buffer.byteLength(chunk, "utf8");
+      if (responseBytes > DEFAULT_MAX_CONTROL_RESPONSE_BYTES) {
+        socket.destroy();
+        finish({ ok: false, error: "Supervisor response is too large." }, true);
+        return;
+      }
+
       response += chunk;
     });
 
@@ -95,13 +147,37 @@ export async function sendControlCommand(
       try {
         finish(JSON.parse(response) as ControlResponse);
       } catch {
-        finish({ ok: false, error: "Supervisor returned an invalid response." });
+        finish({ ok: false, error: "Supervisor returned an invalid response." }, true);
       }
     });
 
     socket.on("error", (error) => {
-      removeSupervisorState(projectRoot);
-      finish({ ok: false, error: `Unable to reach prwr supervisor: ${error.message}` });
+      finish({ ok: false, error: `Unable to reach prwr supervisor: ${error.message}` }, true);
     });
   });
+}
+
+function isSupervisorIdentity(value: unknown): value is SupervisorIdentity {
+  return (
+    isRecord(value) &&
+    typeof value.supervisorPid === "number" &&
+    Number.isInteger(value.supervisorPid) &&
+    value.supervisorPid > 0 &&
+    typeof value.projectRoot === "string" &&
+    typeof value.configPath === "string" &&
+    typeof value.startedAt === "string"
+  );
+}
+
+function identityMatchesState(identity: SupervisorIdentity, state: SupervisorStateFile): boolean {
+  return (
+    identity.supervisorPid === state.supervisorPid &&
+    identity.projectRoot === state.projectRoot &&
+    identity.configPath === state.configPath &&
+    identity.startedAt === state.startedAt
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

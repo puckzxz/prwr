@@ -9,9 +9,11 @@ export interface ProcessManagerOptions {
   killProcessTree?: (pid: number) => Promise<void>;
   onFatalExit?: (name: string, status: ProcessStatus) => void;
   stopTimeoutMs?: number;
+  now?: () => number;
 }
 
 const DEFAULT_STOP_TIMEOUT_MS = 7000;
+export const MAX_STDIN_PAYLOAD_BYTES = 16 * 1024;
 
 export class ProcessManager {
   private readonly processes = new Map<string, ManagedProcess>();
@@ -20,6 +22,7 @@ export class ProcessManager {
   private readonly killProcessTree: (pid: number) => Promise<void>;
   private readonly onFatalExit?: (name: string, status: ProcessStatus) => void;
   private readonly stopTimeoutMs: number;
+  private readonly now: () => number;
   private readonly stopPromises = new Map<string, Promise<boolean>>();
   private shuttingDown = false;
 
@@ -29,6 +32,7 @@ export class ProcessManager {
     this.killProcessTree = options.killProcessTree ?? ((pid) => killTree(pid));
     this.onFatalExit = options.onFatalExit;
     this.stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
+    this.now = options.now ?? (() => Date.now());
 
     for (const processConfig of config.processes) {
       this.processes.set(processConfig.name, {
@@ -44,7 +48,9 @@ export class ProcessManager {
         restartCount: 0,
         lastError: null,
         stopRequested: false,
-        restartTimer: null
+        restartTimer: null,
+        restartAttempts: 0,
+        lastStartedAt: null
       });
     }
   }
@@ -61,7 +67,12 @@ export class ProcessManager {
 
   async start(name: string): Promise<ProcessStatus> {
     const processState = this.getProcessOrThrow(name);
+    processState.restartAttempts = 0;
+    return this.startProcess(processState);
+  }
 
+  private async startProcess(processState: ManagedProcess): Promise<ProcessStatus> {
+    const name = processState.name;
     if (this.shuttingDown) {
       throw new Error("Cannot start processes while prwr is shutting down.");
     }
@@ -97,7 +108,7 @@ export class ProcessManager {
         FORCE_COLOR: process.env.FORCE_COLOR ?? "1",
         ...processState.config.env
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [processState.config.stdin ? "pipe" : "ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true
     };
@@ -112,6 +123,7 @@ export class ProcessManager {
 
     processState.child = child;
     processState.pid = child.pid ?? null;
+    processState.lastStartedAt = this.now();
 
     if (child.stdout) {
       child.stdout.on("data", (chunk: Buffer) => {
@@ -160,12 +172,36 @@ export class ProcessManager {
     this.logger.lifecycle(name, "restarting...");
     processState.state = "restarting";
     processState.restartCount += 1;
+    processState.restartAttempts = 0;
     const stopped = await this.stopProcess(processState);
     if (!stopped) {
       throw new Error(`Process "${name}" did not stop cleanly; not restarting.`);
     }
 
     return this.start(name);
+  }
+
+  async send(name: string, text: string): Promise<{ message: string }> {
+    if (Buffer.byteLength(text, "utf8") > MAX_STDIN_PAYLOAD_BYTES) {
+      throw new Error(`Input is too large; maximum is ${MAX_STDIN_PAYLOAD_BYTES} bytes.`);
+    }
+
+    const processState = this.getProcessOrThrow(name);
+    if (!processState.config.stdin) {
+      throw new Error(`Process "${name}" does not have stdin enabled.`);
+    }
+
+    if (!processState.child || processState.state !== "running") {
+      throw new Error(`Process "${name}" is not running.`);
+    }
+
+    const stdin = processState.child.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) {
+      throw new Error(`Process "${name}" stdin is not writable.`);
+    }
+
+    await writeToStdin(stdin, `${text}\n`);
+    return { message: `sent input to ${name}` };
   }
 
   async stopAll(): Promise<boolean> {
@@ -205,6 +241,8 @@ export class ProcessManager {
       processState.child = null;
       processState.pid = null;
       processState.state = "stopped";
+      processState.restartAttempts = 0;
+      processState.lastStartedAt = null;
       return true;
     }
 
@@ -230,6 +268,8 @@ export class ProcessManager {
       processState.child = null;
       processState.pid = null;
       processState.state = "stopped";
+      processState.restartAttempts = 0;
+      processState.lastStartedAt = null;
       return true;
     }
 
@@ -269,21 +309,48 @@ export class ProcessManager {
     }
 
     if (shouldRestart) {
-      processState.state = "restarting";
-      processState.restartCount += 1;
-      this.logger.lifecycle(processState.name, "restarting...");
-      processState.restartTimer = setTimeout(() => {
-        processState.restartTimer = null;
-        void this.start(processState.name).catch((error) => {
-          processState.state = "failed";
-          processState.lastError = errorMessage(error);
-          this.logger.lifecycle(processState.name, processState.lastError ?? "restart failed", "stderr");
-        });
-      }, Math.max(100, processState.config.startupDelayMs));
+      this.scheduleRestart(processState);
       return;
     }
 
     processState.state = processState.lastError ? "failed" : "stopped";
+    processState.restartAttempts = 0;
+    processState.lastStartedAt = null;
+  }
+
+  private scheduleRestart(processState: ManagedProcess): void {
+    if (shouldResetRestartAttempts(processState, this.now())) {
+      processState.restartAttempts = 0;
+    }
+
+    const nextAttempt = processState.restartAttempts + 1;
+    if (
+      processState.config.restartMaxAttempts > 0 &&
+      nextAttempt > processState.config.restartMaxAttempts
+    ) {
+      processState.state = "failed";
+      processState.lastStartedAt = null;
+      processState.lastError = `Restart limit reached after ${processState.restartAttempts} attempt${
+        processState.restartAttempts === 1 ? "" : "s"
+      }.`;
+      this.logger.lifecycle(processState.name, processState.lastError, "stderr");
+      return;
+    }
+
+    const delayMs = restartDelayMs(processState.config, nextAttempt);
+    processState.state = "restarting";
+    processState.restartAttempts = nextAttempt;
+    processState.restartCount += 1;
+    processState.lastStartedAt = null;
+    this.logger.lifecycle(processState.name, `restarting in ${delayMs}ms...`);
+    processState.restartTimer = setTimeout(() => {
+      processState.restartTimer = null;
+      void this.startProcess(processState).catch((error) => {
+        processState.state = "failed";
+        processState.lastError = errorMessage(error);
+        this.logger.lifecycle(processState.name, processState.lastError ?? "restart failed", "stderr");
+      });
+    }, delayMs);
   }
 
   private shouldRestart(
@@ -342,6 +409,46 @@ function clearRestartTimer(processState: ManagedProcess): void {
     clearTimeout(processState.restartTimer);
     processState.restartTimer = null;
   }
+}
+
+function shouldResetRestartAttempts(processState: ManagedProcess, now: number): boolean {
+  if (processState.config.restartBackoffResetMs <= 0 || processState.lastStartedAt === null) {
+    return false;
+  }
+
+  return now - processState.lastStartedAt >= processState.config.restartBackoffResetMs;
+}
+
+function restartDelayMs(
+  config: Pick<
+    ManagedProcess["config"],
+    "startupDelayMs" | "restartBackoffMs" | "restartBackoffMaxMs"
+  >,
+  attempt: number
+): number {
+  const baseDelay = config.restartBackoffMs > 0 ? config.restartBackoffMs : Math.max(100, config.startupDelayMs);
+  const backoffEnabled = config.restartBackoffMs > 0 || config.restartBackoffMaxMs > 0;
+  if (!backoffEnabled) {
+    return baseDelay;
+  }
+
+  const exponentialDelay = baseDelay * 2 ** Math.max(0, attempt - 1);
+  return config.restartBackoffMaxMs > 0
+    ? Math.min(config.restartBackoffMaxMs, exponentialDelay)
+    : exponentialDelay;
+}
+
+function writeToStdin(stdin: NonNullable<ChildProcess["stdin"]>, text: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    stdin.write(text, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
 }
 
 function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {

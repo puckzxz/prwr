@@ -29,6 +29,7 @@ processes:
 
   web:
     command: npm run dev:web
+    stdin: true
     env:
       PORT: "3000"
 
@@ -48,9 +49,11 @@ From another terminal in the same folder:
 ```powershell
 prwr status
 prwr restart backend
+prwr send web rs
 prwr stop docs
 prwr start docs
 prwr down
+prwr check
 ```
 
 ## Config Files
@@ -84,7 +87,12 @@ processes:
       PORT: "3001"
     restart: manual
     killOnExit: false
+    stdin: false
     startupDelayMs: 0
+    restartBackoffMs: 0
+    restartBackoffMaxMs: 0
+    restartBackoffResetMs: 0
+    restartMaxAttempts: 0
 ```
 
 - `command`: command to run. Required.
@@ -92,7 +100,12 @@ processes:
 - `env`: environment values merged with the parent process.
 - `restart`: `manual`, `always`, or `on-failure`. Defaults to `manual`.
 - `killOnExit`: when true, this process exiting stops the whole supervisor.
+- `stdin`: when true, enables `prwr send <name> <text>` for this process.
 - `startupDelayMs`: delay before starting the process.
+- `restartBackoffMs`: first automatic restart delay. Defaults to the existing `Math.max(100, startupDelayMs)` behavior when unset.
+- `restartBackoffMaxMs`: maximum automatic restart delay. Defaults to no extra backoff cap when unset.
+- `restartBackoffResetMs`: stable run time before automatic restart attempts reset. Defaults to disabled.
+- `restartMaxAttempts`: maximum consecutive automatic restart attempts. `0` means unlimited.
 
 ## Procfile Support
 
@@ -112,10 +125,12 @@ Procfile commands run from the Procfile directory and use manual restart behavio
 | --- | --- |
 | `prwr` | Start the project using the first matching config file. |
 | `prwr up` | Same as `prwr`. |
+| `prwr check` | Validate config, resolved working directories, and supervisor state without starting processes. |
 | `prwr status` | Show supervisor and process state. |
 | `prwr restart <name>` | Kill one process tree and start it again. |
 | `prwr stop <name>` | Stop one process. |
 | `prwr start <name>` | Start one stopped process. |
+| `prwr send <name> <text>` | Send one newline-terminated input command to a process with `stdin: true`. |
 | `prwr down` | Stop every process tree and exit the supervisor. |
 
 ## Windows Behavior
@@ -138,6 +153,19 @@ Use `--no-color` or `NO_COLOR=1` to turn label colors off:
 
 ```powershell
 prwr --no-color
+```
+
+`--no-color` only controls `prwr` labels. Child commands still decide their own color output, and `prwr` preserves the existing default of setting `FORCE_COLOR=1` unless it is already set.
+
+Use `--timestamps` to prefix each log line with local time:
+
+```powershell
+prwr --timestamps
+prwr up --timestamps
+```
+
+```text
+14:32:07 backend | Ready on http://localhost:8787
 ```
 
 ## Local Development
@@ -167,6 +195,6 @@ CI runs on pushes and tags. npm publishing is intentionally manual for now.
 
 ## Limitations
 
-- Child stdin is ignored, so interactive child processes are not supported.
+- Child stdin is ignored unless `stdin: true` is set. `prwr send` is one-shot command input, not an interactive terminal.
 - Child color output depends on the child tool.
 - Windows stops use `taskkill /F`, so shutdown is forceful by design.

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { colorForName, PrefixedLogger, type WritableStreamLike } from "../src/logger.js";
+import {
+  colorForName,
+  formatLocalTime,
+  PrefixedLogger,
+  type WritableStreamLike
+} from "../src/logger.js";
 
 class MemoryStream implements WritableStreamLike {
   isTTY = false;
@@ -43,5 +48,40 @@ describe("PrefixedLogger", () => {
 
   it("uses stable name colors", () => {
     expect(colorForName("backend", "backend | ")).toBe(colorForName("backend", "backend | "));
+  });
+
+  it("prefixes local timestamps before process names when enabled", () => {
+    const stdout = new MemoryStream();
+    const logger = new PrefixedLogger({
+      names: ["api"],
+      stdout,
+      colorMode: "never",
+      timestamps: true,
+      now: () => new Date(2026, 4, 1, 14, 32, 7)
+    });
+
+    logger.write("api", "stdout", "ready\n");
+
+    expect(stdout.value).toBe("14:32:07 api | ready\n");
+  });
+
+  it("leaves timestamps uncolored when labels are colored", () => {
+    const stdout = new MemoryStream();
+    const logger = new PrefixedLogger({
+      names: ["api"],
+      stdout,
+      colorMode: "always",
+      timestamps: true,
+      now: () => new Date(2026, 4, 1, 14, 32, 7)
+    });
+
+    logger.write("api", "stdout", "ready\n");
+
+    expect(stdout.value.startsWith("14:32:07 \u001B[")).toBe(true);
+    expect(stdout.value.endsWith("ready\n")).toBe(true);
+  });
+
+  it("formats local times with zero padding", () => {
+    expect(formatLocalTime(new Date(2026, 4, 1, 4, 5, 6))).toBe("04:05:06");
   });
 });

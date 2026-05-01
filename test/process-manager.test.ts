@@ -4,10 +4,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { isPidAlive } from "../src/kill-tree.js";
 import { PrefixedLogger, type WritableStreamLike } from "../src/logger.js";
-import { ProcessManager, type ProcessManagerOptions } from "../src/process-manager.js";
+import {
+  MAX_STDIN_PAYLOAD_BYTES,
+  ProcessManager,
+  type ProcessManagerOptions
+} from "../src/process-manager.js";
 import type { LoadedConfig, ProcessConfig } from "../src/types.js";
 
 class MemoryStream implements WritableStreamLike {
@@ -42,7 +46,12 @@ function processConfig(overrides: Partial<ProcessConfig> = {}): ProcessConfig {
     env: {},
     restart: "manual",
     killOnExit: false,
+    stdin: false,
     startupDelayMs: 0,
+    restartBackoffMs: 0,
+    restartBackoffMaxMs: 0,
+    restartBackoffResetMs: 0,
+    restartMaxAttempts: 0,
     ...overrides
   };
 }
@@ -125,6 +134,57 @@ describe("ProcessManager", () => {
     expect(status?.state).toBe("running");
     expect(status?.restartCount).toBe(1);
     await manager.stop("api");
+  });
+
+  it("sends newline-terminated input to stdin-enabled processes", async () => {
+    const child = fakeChild(9350, { stdin: true });
+    let input = "";
+    child.stdin?.on("data", (chunk: Buffer) => {
+      input += chunk.toString();
+    });
+    const { manager } = managerFor([processConfig({ stdin: true })], {
+      spawnProcess: (() => child) as typeof spawn
+    });
+
+    await manager.start("api");
+    await manager.send("api", "rs");
+
+    expect(input).toBe("rs\n");
+  });
+
+  it("rejects sends when stdin is disabled", async () => {
+    const { manager } = managerFor([processConfig()]);
+
+    await manager.start("api");
+
+    await expect(manager.send("api", "rs")).rejects.toThrow(/stdin enabled/);
+    await manager.stop("api");
+  });
+
+  it("rejects sends to stopped processes", async () => {
+    const { manager } = managerFor([processConfig({ stdin: true })]);
+
+    await expect(manager.send("api", "rs")).rejects.toThrow(/not running/);
+  });
+
+  it("rejects sends when stdin is closed", async () => {
+    const child = fakeChild(9351, { stdin: true });
+    const { manager } = managerFor([processConfig({ stdin: true })], {
+      spawnProcess: (() => child) as typeof spawn
+    });
+
+    await manager.start("api");
+    child.stdin?.destroy();
+
+    await expect(manager.send("api", "rs")).rejects.toThrow(/stdin is not writable/);
+  });
+
+  it("rejects oversized stdin payloads", async () => {
+    const { manager } = managerFor([processConfig({ stdin: true })]);
+
+    await expect(manager.send("api", "x".repeat(MAX_STDIN_PAYLOAD_BYTES + 1))).rejects.toThrow(
+      /too large/
+    );
   });
 
   it("waits for the old process to exit before spawning a restart replacement", async () => {
@@ -251,6 +311,156 @@ describe("ProcessManager", () => {
 
     expect(manager.getStatus()[0]?.restartCount).toBeGreaterThan(0);
   });
+
+  it("uses exponential restart backoff capped by config", async () => {
+    vi.useFakeTimers();
+    try {
+      const children: ChildProcess[] = [];
+      let nextPid = 9400;
+      const spawnProcess = (() => {
+        const child = fakeChild(nextPid);
+        nextPid += 1;
+        children.push(child);
+        return child;
+      }) as typeof spawn;
+      const { manager } = managerFor(
+        [
+          processConfig({
+            restart: "always",
+            restartBackoffMs: 10,
+            restartBackoffMaxMs: 25
+          })
+        ],
+        { spawnProcess }
+      );
+
+      await manager.start("api");
+      children[0]?.emit("exit", 1, null);
+      await vi.advanceTimersByTimeAsync(9);
+      expect(children).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(children).toHaveLength(2);
+
+      children[1]?.emit("exit", 1, null);
+      await vi.advanceTimersByTimeAsync(19);
+      expect(children).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(children).toHaveLength(3);
+
+      children[2]?.emit("exit", 1, null);
+      await vi.advanceTimersByTimeAsync(24);
+      expect(children).toHaveLength(3);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(children).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops restarting after max automatic attempts", async () => {
+    vi.useFakeTimers();
+    try {
+      const children: ChildProcess[] = [];
+      const spawnProcess = (() => {
+        const child = fakeChild(9500 + children.length);
+        children.push(child);
+        return child;
+      }) as typeof spawn;
+      const { manager } = managerFor(
+        [
+          processConfig({
+            restart: "always",
+            restartBackoffMs: 1,
+            restartBackoffMaxMs: 1,
+            restartMaxAttempts: 1
+          })
+        ],
+        { spawnProcess }
+      );
+
+      await manager.start("api");
+      children[0]?.emit("exit", 1, null);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(children).toHaveLength(2);
+
+      children[1]?.emit("exit", 1, null);
+
+      const status = manager.getStatus()[0];
+      expect(status?.state).toBe("failed");
+      expect(status?.lastError).toContain("Restart limit reached");
+      expect(children).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resets automatic restart backoff after a stable run", async () => {
+    vi.useFakeTimers();
+    try {
+      let now = 0;
+      const children: ChildProcess[] = [];
+      const spawnProcess = (() => {
+        const child = fakeChild(9600 + children.length);
+        children.push(child);
+        return child;
+      }) as typeof spawn;
+      const { manager } = managerFor(
+        [
+          processConfig({
+            restart: "always",
+            restartBackoffMs: 10,
+            restartBackoffResetMs: 50
+          })
+        ],
+        { spawnProcess, now: () => now }
+      );
+
+      await manager.start("api");
+      children[0]?.emit("exit", 1, null);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(children).toHaveLength(2);
+
+      now = 100;
+      children[1]?.emit("exit", 1, null);
+      await vi.advanceTimersByTimeAsync(9);
+      expect(children).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(children).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pending automatic restarts when stopped manually", async () => {
+    vi.useFakeTimers();
+    try {
+      const children: ChildProcess[] = [];
+      const spawnProcess = (() => {
+        const child = fakeChild(9700 + children.length);
+        children.push(child);
+        return child;
+      }) as typeof spawn;
+      const { manager } = managerFor(
+        [
+          processConfig({
+            restart: "always",
+            restartBackoffMs: 100
+          })
+        ],
+        { spawnProcess }
+      );
+
+      await manager.start("api");
+      children[0]?.emit("exit", 1, null);
+      await manager.stop("api");
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(children).toHaveLength(1);
+      expect(manager.getStatus()[0]?.state).toBe("stopped");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -267,10 +477,11 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
   }
 }
 
-function fakeChild(pid: number): ChildProcess {
+function fakeChild(pid: number, options: { stdin?: boolean } = {}): ChildProcess {
   const child = new EventEmitter() as ChildProcess;
   Object.assign(child, {
     pid,
+    stdin: options.stdin ? new PassThrough() : null,
     stdout: new PassThrough(),
     stderr: new PassThrough()
   });

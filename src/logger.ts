@@ -10,6 +10,8 @@ export interface PrefixedLoggerOptions {
   stdout?: WritableStreamLike;
   stderr?: WritableStreamLike;
   colorMode?: ColorMode;
+  timestamps?: boolean;
+  now?: () => Date;
 }
 
 type StreamKind = "stdout" | "stderr";
@@ -35,12 +37,16 @@ export class PrefixedLogger {
   private readonly stderr: WritableStreamLike;
   private readonly width: number;
   private readonly colorMode: ColorMode;
+  private readonly timestamps: boolean;
+  private readonly now: () => Date;
   private readonly buffers = new Map<string, string>();
 
   constructor(options: PrefixedLoggerOptions) {
     this.stdout = options.stdout ?? process.stdout;
     this.stderr = options.stderr ?? process.stderr;
     this.colorMode = options.colorMode ?? "auto";
+    this.timestamps = options.timestamps ?? false;
+    this.now = options.now ?? (() => new Date());
     this.width = Math.max(1, ...options.names.map((name) => name.length));
   }
 
@@ -80,9 +86,10 @@ export class PrefixedLogger {
 
   private writeLine(name: string, stream: StreamKind, line: string): void {
     const destination = stream === "stdout" ? this.stdout : this.stderr;
+    const timestamp = this.timestamps ? `${formatLocalTime(this.now())} ` : "";
     const prefix = `${name.padEnd(this.width)} | `;
     const renderedPrefix = this.shouldColor(destination) ? colorForName(name, prefix) : prefix;
-    destination.write(`${renderedPrefix}${line}\n`);
+    destination.write(`${timestamp}${renderedPrefix}${line}\n`);
   }
 
   private shouldColor(destination: WritableStreamLike): boolean {
@@ -114,4 +121,10 @@ export function hashName(name: string): number {
   }
 
   return hash;
+}
+
+export function formatLocalTime(date: Date): string {
+  return [date.getHours(), date.getMinutes(), date.getSeconds()]
+    .map((value) => String(value).padStart(2, "0"))
+    .join(":");
 }

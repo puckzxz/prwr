@@ -1,23 +1,31 @@
 #!/usr/bin/env node
 import path from "node:path";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { runUp, sendProjectCommand } from "./supervisor.js";
+import { runCheck, runUp, sendProjectCommand } from "./supervisor.js";
 import type { ColorMode, ControlCommand, SupervisorStatus } from "./types.js";
 
 type CliCommand =
-  | { type: "up"; colorMode: ColorMode; configPath?: string; procfilePath?: string; positionalPath?: string }
+  | {
+      type: "up";
+      colorMode: ColorMode;
+      timestamps: boolean;
+      configPath?: string;
+      procfilePath?: string;
+      positionalPath?: string;
+    }
+  | { type: "check"; configPath?: string; procfilePath?: string; positionalPath?: string }
   | { type: "control"; colorMode: ColorMode; command: ControlCommand }
   | { type: "help" }
   | { type: "version" };
 
-const CONTROL_COMMANDS = new Set(["down", "restart", "stop", "start", "status"]);
+const CONTROL_COMMANDS = new Set(["down", "restart", "stop", "start", "status", "send"]);
 
 export function parseCliArgs(argv: string[]): CliCommand {
-  const { args, colorMode } = parseGlobalFlags(argv);
+  const { args, colorMode, timestamps } = parseGlobalFlags(argv);
 
   if (args.length === 0) {
-    return { type: "up", colorMode };
+    return { type: "up", colorMode, timestamps };
   }
 
   const [command, ...rest] = args;
@@ -31,7 +39,11 @@ export function parseCliArgs(argv: string[]): CliCommand {
   }
 
   if (command === "up") {
-    return { type: "up", colorMode, ...parseUpOptions(rest) };
+    return { type: "up", colorMode, timestamps, ...parseUpOptions(rest) };
+  }
+
+  if (command === "check") {
+    return { type: "check", ...parseUpOptions(rest) };
   }
 
   if (CONTROL_COMMANDS.has(command ?? "")) {
@@ -46,7 +58,7 @@ export function parseCliArgs(argv: string[]): CliCommand {
     throw new Error(`Unexpected argument "${rest[0]}".`);
   }
 
-  return { type: "up", colorMode, positionalPath: command };
+  return { type: "up", colorMode, timestamps, positionalPath: command };
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -57,12 +69,20 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       printUsage();
       return 0;
     case "version":
-      console.log("0.1.0");
+      console.log(packageVersion());
       return 0;
+    case "check":
+      return runCheck({
+        cwd: process.cwd(),
+        configPath: command.configPath,
+        procfilePath: command.procfilePath,
+        positionalPath: command.positionalPath
+      });
     case "up":
       return runUp({
         cwd: process.cwd(),
         colorMode: command.colorMode,
+        timestamps: command.timestamps,
         configPath: command.configPath,
         procfilePath: command.procfilePath,
         positionalPath: command.positionalPath
@@ -87,21 +107,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 }
 
-function parseGlobalFlags(argv: string[]): { args: string[]; colorMode: ColorMode } {
+function parseGlobalFlags(argv: string[]): {
+  args: string[];
+  colorMode: ColorMode;
+  timestamps: boolean;
+} {
   const args: string[] = [];
   let colorMode: ColorMode = "always";
+  let timestamps = false;
 
   for (const arg of argv) {
     if (arg === "--color") {
       colorMode = "always";
     } else if (arg === "--no-color") {
       colorMode = "never";
+    } else if (arg === "--timestamps") {
+      timestamps = true;
     } else {
       args.push(arg);
     }
   }
 
-  return { args, colorMode };
+  return { args, colorMode, timestamps };
 }
 
 function parseUpOptions(args: string[]): {
@@ -148,6 +175,15 @@ function parseControlCommand(command: string, args: string[]): ControlCommand {
     throw new Error(`Command "${command}" requires a process name.`);
   }
 
+  if (command === "send") {
+    const text = args.slice(1).join(" ");
+    if (!text) {
+      throw new Error('Command "send" requires text to send.');
+    }
+
+    return { type: "send", name, text };
+  }
+
   if (args.length > 1) {
     throw new Error(`Unexpected argument "${args[1]}".`);
   }
@@ -174,9 +210,12 @@ function printUsage(): void {
   prwr restart <name>
   prwr stop <name>
   prwr start <name>
+  prwr send <name> <text>
   prwr down
+  prwr check [--config ./.prwr.yml]
 
-Labels are colored by default. Use --no-color or NO_COLOR=1 to disable colors.`);
+Labels are colored by default. Use --no-color or NO_COLOR=1 to disable label colors.
+Use --timestamps to prefix log lines with local HH:mm:ss timestamps.`);
 }
 
 function printStatus(status: SupervisorStatus): void {
@@ -213,6 +252,16 @@ function printStatus(status: SupervisorStatus): void {
 
 function assertNever(value: never): never {
   throw new Error(`Unhandled command: ${String(value)}`);
+}
+
+function packageVersion(): string {
+  const raw = readFileSync(new URL("../package.json", import.meta.url), "utf8");
+  const parsed = JSON.parse(raw) as { version?: unknown };
+  if (typeof parsed.version !== "string") {
+    throw new Error("package.json is missing a version.");
+  }
+
+  return parsed.version;
 }
 
 if (isDirectRun()) {

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 export interface KillTreeOptions {
   platform?: NodeJS.Platform;
   timeoutMs?: number;
+  killProcess?: typeof process.kill;
 }
 
 const DEFAULT_TIMEOUT_MS = 5000;
@@ -10,13 +11,14 @@ const DEFAULT_TIMEOUT_MS = 5000;
 export async function killTree(pid: number, options: KillTreeOptions = {}): Promise<void> {
   const platform = options.platform ?? process.platform;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const killProcess = options.killProcess ?? process.kill;
 
   if (platform === "win32") {
     await runTaskkill(pid);
     return;
   }
 
-  await killPosixProcessGroup(pid, timeoutMs);
+  await killPosixProcessGroup(pid, timeoutMs, killProcess);
 }
 
 async function runTaskkill(pid: number): Promise<void> {
@@ -45,26 +47,34 @@ async function runTaskkill(pid: number): Promise<void> {
   });
 }
 
-async function killPosixProcessGroup(pid: number, timeoutMs: number): Promise<void> {
-  signalProcessGroup(pid, "SIGTERM");
+async function killPosixProcessGroup(
+  pid: number,
+  timeoutMs: number,
+  killProcess: typeof process.kill
+): Promise<void> {
+  signalProcessGroup(pid, "SIGTERM", killProcess);
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isPidAlive(pid)) {
+    if (!isProcessGroupAlive(pid, killProcess)) {
       return;
     }
 
     await delay(100);
   }
 
-  if (isPidAlive(pid)) {
-    signalProcessGroup(pid, "SIGKILL");
+  if (isProcessGroupAlive(pid, killProcess)) {
+    signalProcessGroup(pid, "SIGKILL", killProcess);
   }
 }
 
-function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+function signalProcessGroup(
+  pid: number,
+  signal: NodeJS.Signals,
+  killProcess: typeof process.kill
+): void {
   try {
-    process.kill(-pid, signal);
+    killProcess(-pid, signal);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ESRCH") {
@@ -72,7 +82,7 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
     }
 
     try {
-      process.kill(pid, signal);
+      killProcess(pid, signal);
     } catch (innerError) {
       const innerCode = (innerError as NodeJS.ErrnoException).code;
       if (innerCode !== "ESRCH") {
@@ -82,13 +92,34 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-export function isPidAlive(pid: number): boolean {
+export function isPidAlive(pid: number, killProcess: typeof process.kill = process.kill): boolean {
   try {
-    process.kill(pid, 0);
+    killProcess(pid, 0);
     return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     return code === "EPERM";
+  }
+}
+
+export function isProcessGroupAlive(
+  pid: number,
+  killProcess: typeof process.kill = process.kill
+): boolean {
+  try {
+    killProcess(-pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") {
+      return false;
+    }
+
+    if (code === "EPERM") {
+      return true;
+    }
+
+    return isPidAlive(pid, killProcess);
   }
 }
 

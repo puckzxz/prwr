@@ -6,6 +6,20 @@ import type { LoadedConfig, ProcessConfig, RestartPolicy } from "./types.js";
 
 const CONFIG_SEARCH_ORDER = [".prwr.yml", ".prwr.yaml", "Procfile.dev", "Procfile"];
 const RESTART_POLICIES = new Set<RestartPolicy>(["manual", "always", "on-failure"]);
+const TOP_LEVEL_FIELDS = new Set(["processes"]);
+const PROCESS_FIELDS = new Set([
+  "command",
+  "cwd",
+  "env",
+  "restart",
+  "killOnExit",
+  "stdin",
+  "startupDelayMs",
+  "restartBackoffMs",
+  "restartBackoffMaxMs",
+  "restartBackoffResetMs",
+  "restartMaxAttempts"
+]);
 
 export interface LoadConfigOptions {
   cwd: string;
@@ -97,7 +111,12 @@ function loadProcfileConfig(configPath: string, configDir: string, source: strin
     env: {},
     restart: "manual",
     killOnExit: false,
-    startupDelayMs: 0
+    stdin: false,
+    startupDelayMs: 0,
+    restartBackoffMs: 0,
+    restartBackoffMaxMs: 0,
+    restartBackoffResetMs: 0,
+    restartMaxAttempts: 0
   }));
 
   return {
@@ -114,6 +133,8 @@ function loadYamlConfig(configPath: string, configDir: string, source: string): 
   if (!isRecord(parsed)) {
     throw new Error("Invalid .prwr.yml: expected an object.");
   }
+
+  validateKnownFields(Object.keys(parsed), TOP_LEVEL_FIELDS, "top-level");
 
   const processesValue = parsed.processes;
   if (!isRecord(processesValue)) {
@@ -150,6 +171,8 @@ function normalizeProcessConfig(
     throw new Error(`Invalid process "${name}": expected an object or command string.`);
   }
 
+  validateKnownFields(Object.keys(raw), PROCESS_FIELDS, `process "${name}"`);
+
   if (typeof raw.command !== "string" || raw.command.trim().length === 0) {
     throw new Error(`Invalid process "${name}": command is required.`);
   }
@@ -158,7 +181,12 @@ function normalizeProcessConfig(
   const env = normalizeEnv(name, raw.env);
   const restart = normalizeRestart(name, raw.restart);
   const killOnExit = normalizeBoolean(name, "killOnExit", raw.killOnExit, false);
-  const startupDelayMs = normalizeDelay(name, raw.startupDelayMs);
+  const stdin = normalizeBoolean(name, "stdin", raw.stdin, false);
+  const startupDelayMs = normalizeDelay(name, "startupDelayMs", raw.startupDelayMs);
+  const restartBackoffMs = normalizeDelay(name, "restartBackoffMs", raw.restartBackoffMs);
+  const restartBackoffMaxMs = normalizeDelay(name, "restartBackoffMaxMs", raw.restartBackoffMaxMs);
+  const restartBackoffResetMs = normalizeDelay(name, "restartBackoffResetMs", raw.restartBackoffResetMs);
+  const restartMaxAttempts = normalizeCount(name, "restartMaxAttempts", raw.restartMaxAttempts);
 
   return {
     name,
@@ -167,7 +195,12 @@ function normalizeProcessConfig(
     env,
     restart,
     killOnExit,
-    startupDelayMs
+    stdin,
+    startupDelayMs,
+    restartBackoffMs,
+    restartBackoffMaxMs,
+    restartBackoffResetMs,
+    restartMaxAttempts
   };
 }
 
@@ -243,16 +276,45 @@ function normalizeBoolean(
   return value;
 }
 
-function normalizeDelay(name: string, value: unknown): number {
+function normalizeDelay(name: string, field: string, value: unknown): number {
   if (value === undefined || value === null) {
     return 0;
   }
 
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new Error(`Invalid process "${name}": startupDelayMs must be a non-negative number.`);
+    throw new Error(`Invalid process "${name}": ${field} must be a non-negative number.`);
   }
 
   return value;
+}
+
+function normalizeCount(name: string, field: string, value: unknown): number {
+  if (value === undefined || value === null) {
+    return 0;
+  }
+
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    !Number.isFinite(value) ||
+    value < 0
+  ) {
+    throw new Error(`Invalid process "${name}": ${field} must be a non-negative integer.`);
+  }
+
+  return value;
+}
+
+function validateKnownFields(
+  fields: string[],
+  allowedFields: Set<string>,
+  context: string
+): void {
+  for (const field of fields) {
+    if (!allowedFields.has(field)) {
+      throw new Error(`Invalid .prwr.yml: unknown ${context} field "${field}".`);
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

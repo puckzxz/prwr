@@ -1,6 +1,6 @@
 {
   "name": "@puckzxz/prwr",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Process Wrangler: a Windows-friendly process supervisor for local development.",
   "license": "Unlicense",
   "type": "module",

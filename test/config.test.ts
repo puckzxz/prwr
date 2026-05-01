@@ -22,7 +22,12 @@ describe("config loading", () => {
       PORT: 3000
     restart: on-failure
     killOnExit: true
+    stdin: true
     startupDelayMs: 10
+    restartBackoffMs: 1000
+    restartBackoffMaxMs: 30000
+    restartBackoffResetMs: 60000
+    restartMaxAttempts: 3
 `
     );
 
@@ -35,7 +40,12 @@ describe("config loading", () => {
       env: { PORT: "3000" },
       restart: "on-failure",
       killOnExit: true,
-      startupDelayMs: 10
+      stdin: true,
+      startupDelayMs: 10,
+      restartBackoffMs: 1000,
+      restartBackoffMaxMs: 30000,
+      restartBackoffResetMs: 60000,
+      restartMaxAttempts: 3
     });
   });
 
@@ -81,5 +91,43 @@ describe("config loading", () => {
     writeFileSync(path.join(dir, ".prwr.yml"), "processes:\n  web:\n    cwd: ./app\n");
 
     expect(() => loadConfig({ cwd: dir })).toThrow(/command is required/);
+  });
+
+  it("rejects unknown top-level yaml fields", () => {
+    const dir = tempDir();
+    writeFileSync(
+      path.join(dir, ".prwr.yml"),
+      "version: 1\nprocesses:\n  web:\n    command: npm start\n"
+    );
+
+    expect(() => loadConfig({ cwd: dir })).toThrow(/unknown top-level field "version"/);
+  });
+
+  it("rejects unknown process fields", () => {
+    const dir = tempDir();
+    writeFileSync(
+      path.join(dir, ".prwr.yml"),
+      "processes:\n  web:\n    command: npm start\n    killOnexit: true\n"
+    );
+
+    expect(() => loadConfig({ cwd: dir })).toThrow(/unknown process "web" field "killOnexit"/);
+  });
+
+  it("rejects invalid stdin and restart values", () => {
+    const dir = tempDir();
+    writeFileSync(
+      path.join(dir, ".prwr.yml"),
+      "processes:\n  web:\n    command: npm start\n    stdin: yes\n"
+    );
+
+    expect(() => loadConfig({ cwd: dir })).toThrow(/stdin must be a boolean/);
+
+    const otherDir = tempDir();
+    writeFileSync(
+      path.join(otherDir, ".prwr.yml"),
+      "processes:\n  web:\n    command: npm start\n    restartMaxAttempts: 1.5\n"
+    );
+
+    expect(() => loadConfig({ cwd: otherDir })).toThrow(/restartMaxAttempts must be a non-negative integer/);
   });
 });
