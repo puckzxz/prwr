@@ -1,0 +1,55 @@
+{
+  "name": "prwr",
+  "version": "0.1.0",
+  "description": "Process Wrangler: a Windows-friendly process supervisor for local development.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.33.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/puckzxz/prwr.git"
+  },
+  "bugs": {
+    "url": "https://github.com/puckzxz/prwr/issues"
+  },
+  "homepage": "https://github.com/puckzxz/prwr#readme",
+  "keywords": [
+    "process-manager",
+    "process-supervisor",
+    "process-wrangler",
+    "procfile",
+    "foreman",
+    "overmind",
+    "windows",
+    "development",
+    "cli"
+  ],
+  "bin": {
+    "prwr": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "dev": "tsx src/cli.ts",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "prepack": "pnpm run build",
+    "pack:check": "npm pack --dry-run"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
