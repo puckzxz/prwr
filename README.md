@@ -14,7 +14,7 @@ web     | VITE v7 ready in 420 ms
 ## Install
 
 ```powershell
-npm install -g prwr
+npm install -g @puckzxz/prwr
 ```
 
 Then add a `.prwr.yml` file to a project and run `prwr` from that project directory.

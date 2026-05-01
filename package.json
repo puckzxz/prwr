@@ -1,5 +1,5 @@
 {
-  "name": "prwr",
+  "name": "@puckzxz/prwr",
   "version": "0.1.0",
   "description": "Process Wrangler: a Windows-friendly process supervisor for local development.",
   "license": "MIT",
@@ -13,6 +13,9 @@
     "url": "https://github.com/puckzxz/prwr/issues"
   },
   "homepage": "https://github.com/puckzxz/prwr#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "process-manager",
     "process-supervisor",
