@@ -1,76 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { EventEmitter } from "node:events";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import { isPidAlive } from "../src/kill-tree.js";
-import { PrefixedLogger, type WritableStreamLike } from "../src/logger.js";
-import {
-  MAX_STDIN_PAYLOAD_BYTES,
-  ProcessManager,
-  type ProcessManagerOptions
-} from "../src/process-manager.js";
-import type { LoadedConfig, ProcessConfig } from "../src/types.js";
-
-class MemoryStream implements WritableStreamLike {
-  value = "";
-
-  write(chunk: string): void {
-    this.value += chunk;
-  }
-}
-
-function nodeCommand(script: string): string {
-  return `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
-}
-
-function configFor(processes: ProcessConfig[]): LoadedConfig {
-  const dir = mkdtempSync(path.join(tmpdir(), "prwr-manager-"));
-  return {
-    configPath: path.join(dir, ".prwr.yml"),
-    configDir: dir,
-    projectRoot: dir,
-    sourceType: "yaml",
-    processes
-  };
-}
-
-function processConfig(overrides: Partial<ProcessConfig> = {}): ProcessConfig {
-  const cwd = mkdtempSync(path.join(tmpdir(), "prwr-proc-"));
-  return {
-    name: "api",
-    command: nodeCommand("setTimeout(() => undefined, 1000)"),
-    cwd,
-    env: {},
-    restart: "manual",
-    killOnExit: false,
-    stdin: false,
-    startupDelayMs: 0,
-    restartBackoffMs: 0,
-    restartBackoffMaxMs: 0,
-    restartBackoffResetMs: 0,
-    restartMaxAttempts: 0,
-    ...overrides
-  };
-}
-
-function managerFor(processes: ProcessConfig[], options: Partial<ProcessManagerOptions> = {}) {
-  const stdout = new MemoryStream();
-  const stderr = new MemoryStream();
-  const logger = new PrefixedLogger({
-    names: processes.map((process) => process.name),
-    stdout,
-    stderr,
-    colorMode: "never"
-  });
-  const manager = new ProcessManager(configFor(processes), {
-    logger,
-    ...options
-  });
-  return { manager, stdout, stderr };
-}
+import { MAX_STDIN_PAYLOAD_BYTES } from "../src/process-manager.js";
+import { delay, fakeChild, managerFor, nodeCommand, processConfig, waitFor } from "./helpers/process-manager.js";
 
 describe("ProcessManager", () => {
   it("starts a short-lived process and records stopped status", async () => {
@@ -187,7 +118,7 @@ describe("ProcessManager", () => {
     );
   });
 
-  it("waits for the old process to exit before spawning a restart replacement", async () => {
+  it("waits for tree cleanup and output closure before spawning a restart replacement", async () => {
     const events: string[] = [];
     const children = new Map<number, ChildProcess>();
     let nextPid = 9100;
@@ -206,13 +137,17 @@ describe("ProcessManager", () => {
         await delay(20);
         events.push(`exit:${pid}`);
         children.get(pid)?.emit("exit", null, "SIGTERM");
+        setTimeout(() => {
+          events.push(`close:${pid}`);
+          children.get(pid)?.emit("close", null, "SIGTERM");
+        }, 20);
       }
     });
 
     await manager.start("api");
     await manager.restart("api");
 
-    expect(events).toEqual(["spawn:9100", "kill:9100", "exit:9100", "spawn:9101"]);
+    expect(events).toEqual(["spawn:9100", "kill:9100", "exit:9100", "close:9100", "spawn:9101"]);
   });
 
   it("shares an in-flight stop during repeated shutdown requests", async () => {
@@ -223,7 +158,7 @@ describe("ProcessManager", () => {
       killProcessTree: async () => {
         killCalls += 1;
         await delay(20);
-        child.emit("exit", null, "SIGTERM");
+        child.emit("close", null, "SIGTERM");
       }
     });
 
@@ -257,39 +192,6 @@ describe("ProcessManager", () => {
 
     expect(spawnCount).toBe(0);
     expect(manager.getStatus()[0]?.state).toBe("stopped");
-  });
-
-  it("flushes final partial stdout and stderr when a child exits", async () => {
-    const process = processConfig({
-      command: nodeCommand("process.stdout.write('out-partial'); process.stderr.write('err-partial')")
-    });
-    const { manager, stdout, stderr } = managerFor([process]);
-
-    await manager.start("api");
-    await waitFor(() => manager.getStatus()[0]?.state === "stopped");
-
-    expect(stdout.value).toContain("api | out-partial\n");
-    expect(stderr.value).toContain("api | err-partial\n");
-  });
-
-  it("stops child process trees so node grandchildren are not left running", async () => {
-    const script =
-      "const { spawn } = require('node:child_process'); " +
-      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); " +
-      "console.log('grandchild=' + child.pid); " +
-      "setInterval(() => {}, 1000);";
-    const process = processConfig({ command: nodeCommand(script) });
-    const { manager, stdout } = managerFor([process]);
-
-    await manager.start("api");
-    await waitFor(() => /grandchild=\d+/.test(stdout.value));
-    const grandchildPid = Number(stdout.value.match(/grandchild=(\d+)/)?.[1]);
-
-    await manager.stop("api");
-    await waitFor(() => !isPidAlive(grandchildPid));
-
-    expect(manager.getStatus()[0]?.state).toBe("stopped");
-    expect(isPidAlive(grandchildPid)).toBe(false);
   });
 
   it("reports unknown process names with available names", async () => {
@@ -335,19 +237,19 @@ describe("ProcessManager", () => {
       );
 
       await manager.start("api");
-      children[0]?.emit("exit", 1, null);
+      children[0]?.emit("close", 1, null);
       await vi.advanceTimersByTimeAsync(9);
       expect(children).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(1);
       expect(children).toHaveLength(2);
 
-      children[1]?.emit("exit", 1, null);
+      children[1]?.emit("close", 1, null);
       await vi.advanceTimersByTimeAsync(19);
       expect(children).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(1);
       expect(children).toHaveLength(3);
 
-      children[2]?.emit("exit", 1, null);
+      children[2]?.emit("close", 1, null);
       await vi.advanceTimersByTimeAsync(24);
       expect(children).toHaveLength(3);
       await vi.advanceTimersByTimeAsync(1);
@@ -379,11 +281,11 @@ describe("ProcessManager", () => {
       );
 
       await manager.start("api");
-      children[0]?.emit("exit", 1, null);
+      children[0]?.emit("close", 1, null);
       await vi.advanceTimersByTimeAsync(1);
       expect(children).toHaveLength(2);
 
-      children[1]?.emit("exit", 1, null);
+      children[1]?.emit("close", 1, null);
 
       const status = manager.getStatus()[0];
       expect(status?.state).toBe("failed");
@@ -416,12 +318,12 @@ describe("ProcessManager", () => {
       );
 
       await manager.start("api");
-      children[0]?.emit("exit", 1, null);
+      children[0]?.emit("close", 1, null);
       await vi.advanceTimersByTimeAsync(10);
       expect(children).toHaveLength(2);
 
       now = 100;
-      children[1]?.emit("exit", 1, null);
+      children[1]?.emit("close", 1, null);
       await vi.advanceTimersByTimeAsync(9);
       expect(children).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(1);
@@ -451,7 +353,7 @@ describe("ProcessManager", () => {
       );
 
       await manager.start("api");
-      children[0]?.emit("exit", 1, null);
+      children[0]?.emit("close", 1, null);
       await manager.stop("api");
       await vi.advanceTimersByTimeAsync(100);
 
@@ -462,34 +364,3 @@ describe("ProcessManager", () => {
     }
   });
 });
-
-async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
-  const startedAt = Date.now();
-
-  while (!predicate()) {
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error("Timed out waiting for condition.");
-    }
-
-    await new Promise((resolve) => {
-      setTimeout(resolve, 25);
-    });
-  }
-}
-
-function fakeChild(pid: number, options: { stdin?: boolean } = {}): ChildProcess {
-  const child = new EventEmitter() as ChildProcess;
-  Object.assign(child, {
-    pid,
-    stdin: options.stdin ? new PassThrough() : null,
-    stdout: new PassThrough(),
-    stderr: new PassThrough()
-  });
-  return child;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}

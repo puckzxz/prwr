@@ -1,25 +1,14 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
-import { parseProcfile, validateProcessName } from "./procfile.js";
-import type { LoadedConfig, ProcessConfig, RestartPolicy } from "./types.js";
+import { parseProcfile } from "./procfile.js";
+import { normalizeProcessConfig } from "./process-config.js";
+import { loadEnvFiles } from "./env-files.js";
+import { orderedProcesses } from "./process-graph.js";
+import type { LoadedConfig } from "./types.js";
 
 const CONFIG_SEARCH_ORDER = [".prwr.yml", ".prwr.yaml", "Procfile.dev", "Procfile"];
-const RESTART_POLICIES = new Set<RestartPolicy>(["manual", "always", "on-failure"]);
-const TOP_LEVEL_FIELDS = new Set(["processes"]);
-const PROCESS_FIELDS = new Set([
-  "command",
-  "cwd",
-  "env",
-  "restart",
-  "killOnExit",
-  "stdin",
-  "startupDelayMs",
-  "restartBackoffMs",
-  "restartBackoffMaxMs",
-  "restartBackoffResetMs",
-  "restartMaxAttempts"
-]);
+const TOP_LEVEL_FIELDS = new Set(["processes", "envFile"]);
 
 export interface LoadConfigOptions {
   cwd: string;
@@ -104,20 +93,7 @@ function isProcfilePath(filePath: string): boolean {
 
 function loadProcfileConfig(configPath: string, configDir: string, source: string): LoadedConfig {
   const entries = parseProcfile(source);
-  const processes = entries.map<ProcessConfig>((entry) => ({
-    name: entry.name,
-    command: entry.command,
-    cwd: configDir,
-    env: {},
-    restart: "manual",
-    killOnExit: false,
-    stdin: false,
-    startupDelayMs: 0,
-    restartBackoffMs: 0,
-    restartBackoffMaxMs: 0,
-    restartBackoffResetMs: 0,
-    restartMaxAttempts: 0
-  }));
+  const processes = entries.map((entry) => normalizeProcessConfig(entry.name, entry.command, configDir));
 
   return {
     configPath,
@@ -146,9 +122,11 @@ function loadYamlConfig(configPath: string, configDir: string, source: string): 
     throw new Error("Invalid .prwr.yml: processes must not be empty.");
   }
 
+  const globalEnv = loadEnvFiles(parsed.envFile, configDir, "top-level");
   const processes = names.map((name) =>
-    normalizeProcessConfig(name, processesValue[name], configDir)
+    normalizeProcessConfig(name, processesValue[name], configDir, globalEnv)
   );
+  orderedProcesses(processes);
 
   return {
     configPath,
@@ -157,152 +135,6 @@ function loadYamlConfig(configPath: string, configDir: string, source: string): 
     sourceType: "yaml",
     processes
   };
-}
-
-function normalizeProcessConfig(
-  name: string,
-  value: unknown,
-  configDir: string
-): ProcessConfig {
-  validateProcessName(name);
-
-  const raw = typeof value === "string" ? { command: value } : value;
-  if (!isRecord(raw)) {
-    throw new Error(`Invalid process "${name}": expected an object or command string.`);
-  }
-
-  validateKnownFields(Object.keys(raw), PROCESS_FIELDS, `process "${name}"`);
-
-  if (typeof raw.command !== "string" || raw.command.trim().length === 0) {
-    throw new Error(`Invalid process "${name}": command is required.`);
-  }
-
-  const cwd = normalizeCwd(name, raw.cwd, configDir);
-  const env = normalizeEnv(name, raw.env);
-  const restart = normalizeRestart(name, raw.restart);
-  const killOnExit = normalizeBoolean(name, "killOnExit", raw.killOnExit, false);
-  const stdin = normalizeBoolean(name, "stdin", raw.stdin, false);
-  const startupDelayMs = normalizeDelay(name, "startupDelayMs", raw.startupDelayMs);
-  const restartBackoffMs = normalizeDelay(name, "restartBackoffMs", raw.restartBackoffMs);
-  const restartBackoffMaxMs = normalizeDelay(name, "restartBackoffMaxMs", raw.restartBackoffMaxMs);
-  const restartBackoffResetMs = normalizeDelay(name, "restartBackoffResetMs", raw.restartBackoffResetMs);
-  const restartMaxAttempts = normalizeCount(name, "restartMaxAttempts", raw.restartMaxAttempts);
-
-  return {
-    name,
-    command: raw.command,
-    cwd,
-    env,
-    restart,
-    killOnExit,
-    stdin,
-    startupDelayMs,
-    restartBackoffMs,
-    restartBackoffMaxMs,
-    restartBackoffResetMs,
-    restartMaxAttempts
-  };
-}
-
-function normalizeCwd(name: string, value: unknown, configDir: string): string {
-  if (value === undefined || value === null) {
-    return configDir;
-  }
-
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new Error(`Invalid process "${name}": cwd must be a non-empty string.`);
-  }
-
-  return path.resolve(configDir, value);
-}
-
-function normalizeEnv(name: string, value: unknown): Record<string, string> {
-  if (value === undefined || value === null) {
-    return {};
-  }
-
-  if (!isRecord(value)) {
-    throw new Error(`Invalid process "${name}": env must be an object.`);
-  }
-
-  const env: Record<string, string> = {};
-  for (const [key, rawValue] of Object.entries(value)) {
-    if (rawValue === undefined || rawValue === null) {
-      continue;
-    }
-
-    if (
-      typeof rawValue !== "string" &&
-      typeof rawValue !== "number" &&
-      typeof rawValue !== "boolean"
-    ) {
-      throw new Error(`Invalid process "${name}": env.${key} must be a scalar value.`);
-    }
-
-    env[key] = String(rawValue);
-  }
-
-  return env;
-}
-
-function normalizeRestart(name: string, value: unknown): RestartPolicy {
-  if (value === undefined || value === null) {
-    return "manual";
-  }
-
-  if (typeof value !== "string" || !RESTART_POLICIES.has(value as RestartPolicy)) {
-    throw new Error(
-      `Invalid process "${name}": restart must be manual, always, or on-failure.`
-    );
-  }
-
-  return value as RestartPolicy;
-}
-
-function normalizeBoolean(
-  name: string,
-  field: string,
-  value: unknown,
-  defaultValue: boolean
-): boolean {
-  if (value === undefined || value === null) {
-    return defaultValue;
-  }
-
-  if (typeof value !== "boolean") {
-    throw new Error(`Invalid process "${name}": ${field} must be a boolean.`);
-  }
-
-  return value;
-}
-
-function normalizeDelay(name: string, field: string, value: unknown): number {
-  if (value === undefined || value === null) {
-    return 0;
-  }
-
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new Error(`Invalid process "${name}": ${field} must be a non-negative number.`);
-  }
-
-  return value;
-}
-
-function normalizeCount(name: string, field: string, value: unknown): number {
-  if (value === undefined || value === null) {
-    return 0;
-  }
-
-  if (
-    typeof value !== "number" ||
-    !Number.isInteger(value) ||
-    !Number.isFinite(value) ||
-    value < 0
-  ) {
-    throw new Error(`Invalid process "${name}": ${field} must be a non-negative integer.`);
-  }
-
-  return value;
 }
 
 function validateKnownFields(

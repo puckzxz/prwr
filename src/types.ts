@@ -2,13 +2,29 @@ import type { ChildProcess } from "node:child_process";
 
 export type RestartPolicy = "manual" | "always" | "on-failure";
 
-export type ProcessRunState = "running" | "stopped" | "restarting" | "failed";
+export type ProcessRunState = "starting" | "running" | "stopped" | "restarting" | "failed";
+
+interface ReadinessTiming {
+  timeoutMs: number;
+  intervalMs: number;
+}
+
+export type ReadinessCheck =
+  | (ReadinessTiming & { type: "tcp"; host: string; port: number })
+  | (ReadinessTiming & { type: "http"; url: string });
+
+export interface ProcessSelection {
+  only?: string[];
+  exclude?: string[];
+}
 
 export interface ProcessConfig {
   name: string;
   command: string;
   cwd: string;
   env: Record<string, string>;
+  dependsOn: string[];
+  readyWhen: ReadinessCheck | null;
   restart: RestartPolicy;
   killOnExit: boolean;
   stdin: boolean;
@@ -46,6 +62,9 @@ export interface ManagedProcess extends ProcessStatus {
   restartTimer: NodeJS.Timeout | null;
   restartAttempts: number;
   lastStartedAt: number | null;
+  startController: AbortController | null;
+  stopVersion: number;
+  treeCleanup: { pid: number; killed: boolean } | null;
 }
 
 export interface SupervisorStateFile {
@@ -66,11 +85,33 @@ export type ControlCommand =
   | { type: "stop"; name: string }
   | { type: "start"; name: string }
   | { type: "send"; name: string; text: string }
+  | { type: "logs"; name: string; tail: number }
   | { type: "down" };
+
+export type LogStream = "stdout" | "stderr";
+export type LogKind = "output" | "lifecycle";
+
+export interface ProcessLogEntry {
+  name: string;
+  stream: LogStream;
+  kind: LogKind;
+  timestamp: string;
+  text: string;
+}
+
+export interface ProcessLogs {
+  name: string;
+  entries: ProcessLogEntry[];
+}
 
 export type ControlResponse =
   | { ok: true; data: unknown }
   | { ok: false; error: string };
+
+export interface ControlEnvelope {
+  token: string;
+  command: ControlCommand;
+}
 
 export interface SupervisorStatus {
   supervisor: PublicSupervisorState;

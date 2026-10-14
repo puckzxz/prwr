@@ -44,13 +44,15 @@
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
-    "yaml": "^2.8.1"
+    "dotenv": "^18.0.7",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
-    "@types/node": "^24.10.1",
-    "tsx": "^4.20.6",
+    "@types/node": "^24.19.2",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.8"
+    "vite": "^8.0.16",
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=20"

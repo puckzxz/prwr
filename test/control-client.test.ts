@@ -42,6 +42,84 @@ describe("control client state", () => {
     expect(existsSync(stateFilePath(dir))).toBe(false);
   });
 
+  it.each([null, [], true, 123, "state", {}, { supervisorPid: process.pid }])(
+    "removes malformed JSON state without throwing: %j",
+    (value) => {
+      const dir = mkdtempSync(path.join(tmpdir(), "prwr-state-"));
+      mkdirSync(path.join(dir, ".prwr"), { recursive: true });
+      writeFileSync(stateFilePath(dir), JSON.stringify(value));
+
+      expect(readSupervisorState(dir)).toBeNull();
+      expect(existsSync(stateFilePath(dir))).toBe(false);
+    }
+  );
+
+  it.each([0, -1, 1.5, 65536])("removes state with invalid TCP port %s", (port) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "prwr-state-"));
+    writeSupervisorState(stateFor(dir, port, "token"));
+
+    expect(readSupervisorState(dir)).toBeNull();
+    expect(existsSync(stateFilePath(dir))).toBe(false);
+  });
+
+  it("rejects a state file copied from another project", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "prwr-state-"));
+    const state = stateFor(dir, 1234, "token");
+    writeSupervisorState(state);
+    writeFileSync(stateFilePath(dir), JSON.stringify({ ...state, projectRoot: path.join(dir, "other") }));
+
+    expect(readSupervisorState(dir)).toBeNull();
+    expect(existsSync(stateFilePath(dir))).toBe(false);
+  });
+
+  it.each([null, true, {}, { ok: true }, { ok: false, error: 123 }])(
+    "rejects malformed control responses without throwing: %j",
+    async (response) => {
+      const dir = mkdtempSync(path.join(tmpdir(), "prwr-state-"));
+      const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+        socket.resume();
+        socket.on("error", () => socket.destroy());
+        socket.on("end", () => socket.end(JSON.stringify(response)));
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address() as net.AddressInfo;
+      writeSupervisorState(stateFor(dir, address.port, "token"));
+
+      try {
+        await expect(readVerifiedSupervisorState(dir)).resolves.toBeNull();
+        expect(existsSync(stateFilePath(dir))).toBe(false);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  );
+
+  it("preserves verified supervisor state when a control operation times out", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "prwr-state-"));
+    const state = stateFor(dir, 0, "token");
+    const server = new ControlServer(async (command) => {
+      if (command.type === "identity") {
+        return identityFor(state);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 5200));
+      return { message: "finished" };
+    }, { token: "token" });
+    state.port = await server.listen();
+    writeSupervisorState(state);
+
+    try {
+      await expect(sendControlCommand(dir, { type: "status" })).resolves.toMatchObject({
+        ok: false,
+        error: "Timed out waiting for prwr supervisor response."
+      });
+      expect(existsSync(stateFilePath(dir))).toBe(true);
+      await expect(readVerifiedSupervisorState(dir)).resolves.toEqual(state);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("sends authenticated control commands through verified supervisor state", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "prwr-state-"));
     const state = stateFor(dir, 0, "token");

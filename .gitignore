@@ -3,3 +3,6 @@ dist/
 .prwr/
 coverage/
 *.log
+.env
+.env.*
+!.env.example

@@ -1,7 +1,12 @@
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { spawn } from "node:child_process";
 import type { LoadedConfig, ManagedProcess, ProcessStatus } from "./types.js";
 import type { PrefixedLogger } from "./logger.js";
 import { killTree } from "./kill-tree.js";
+import { launchProcess } from "./process-launch.js";
+import { stopProcessTree } from "./process-stop.js";
+import { orderedProcesses } from "./process-graph.js";
+import { clearRestartTimer, restartDelayMs, shouldResetRestartAttempts } from "./restart-policy.js";
+import { errorMessage, hasExited, writeToStdin } from "./process-io.js";
 
 export interface ProcessManagerOptions {
   logger: PrefixedLogger;
@@ -24,6 +29,8 @@ export class ProcessManager {
   private readonly stopTimeoutMs: number;
   private readonly now: () => number;
   private readonly stopPromises = new Map<string, Promise<boolean>>();
+  private readonly startPromises = new Map<string, Promise<ProcessStatus>>();
+  private readonly restartPromises = new Map<string, { version: number; promise: Promise<ProcessStatus> }>();
   private shuttingDown = false;
 
   constructor(config: LoadedConfig, options: ProcessManagerOptions) {
@@ -34,7 +41,7 @@ export class ProcessManager {
     this.stopTimeoutMs = options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     this.now = options.now ?? (() => Date.now());
 
-    for (const processConfig of config.processes) {
+    for (const processConfig of orderedProcesses(config.processes)) {
       this.processes.set(processConfig.name, {
         name: processConfig.name,
         config: processConfig,
@@ -50,7 +57,10 @@ export class ProcessManager {
         stopRequested: false,
         restartTimer: null,
         restartAttempts: 0,
-        lastStartedAt: null
+        lastStartedAt: null,
+        startController: null,
+        stopVersion: 0,
+        treeCleanup: null
       });
     }
   }
@@ -66,100 +76,101 @@ export class ProcessManager {
   }
 
   async start(name: string): Promise<ProcessStatus> {
-    const processState = this.getProcessOrThrow(name);
-    processState.restartAttempts = 0;
-    return this.startProcess(processState);
+    const state = this.getProcessOrThrow(name);
+    if (this.shuttingDown) throw new Error("Cannot start processes while prwr is shutting down.");
+    const version = state.stopVersion;
+    const stopping = this.stopPromises.get(name);
+    if (stopping && !(await stopping)) throw new Error(`Process "${name}" did not stop cleanly.`);
+    if (state.stopRequested) await this.startPromises.get(name);
+    if (state.stopVersion !== version || this.shuttingDown) return this.toStatus(state);
+    const pending = this.startPromises.get(name);
+    if (pending) return pending;
+    return this.startProcess(state, true);
   }
 
-  private async startProcess(processState: ManagedProcess): Promise<ProcessStatus> {
-    const name = processState.name;
-    if (this.shuttingDown) {
-      throw new Error("Cannot start processes while prwr is shutting down.");
+  private async startProcess(state: ManagedProcess, resetAttempts = false): Promise<ProcessStatus> {
+    const pending = this.startPromises.get(state.name);
+    if (pending) return pending;
+    if (this.shuttingDown) throw new Error("Cannot start processes while prwr is shutting down.");
+    if (state.treeCleanup) {
+      throw new Error(`Process "${state.name}" has unresolved tree cleanup for pid=${state.treeCleanup.pid}. Stop it successfully before starting again.`);
     }
+    if (state.child || state.pid) throw new Error(`Process "${state.name}" already has an active child process.`);
+    if (resetAttempts) state.restartAttempts = 0;
+    const promise = this.performStart(state).finally(() => {
+      if (this.startPromises.get(state.name) === promise) this.startPromises.delete(state.name);
+    });
+    this.startPromises.set(state.name, promise);
+    return promise;
+  }
 
-    if (processState.child || processState.pid) {
-      throw new Error(`Process "${name}" already has an active child process.`);
-    }
-
-    if (processState.state === "running") {
-      throw new Error(`Process "${name}" is already running.`);
-    }
-
-    clearRestartTimer(processState);
-    processState.stopRequested = false;
-    processState.state = "running";
-    processState.lastError = null;
-
-    if (processState.config.startupDelayMs > 0) {
-      await delay(processState.config.startupDelayMs);
-      if (this.shuttingDown || processState.stopRequested) {
-        processState.child = null;
-        processState.pid = null;
-        processState.state = "stopped";
-        return this.toStatus(processState);
-      }
-    }
-
-    const options: SpawnOptions = {
-      shell: true,
-      cwd: processState.config.cwd,
-      env: {
-        ...process.env,
-        FORCE_COLOR: process.env.FORCE_COLOR ?? "1",
-        ...processState.config.env
-      },
-      stdio: [processState.config.stdin ? "pipe" : "ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-      windowsHide: true
-    };
-
-    let child: ChildProcess;
+  private async performStart(state: ManagedProcess): Promise<ProcessStatus> {
+    clearRestartTimer(state);
+    state.stopRequested = false;
+    state.state = "starting";
+    state.lastError = null;
+    const controller = new AbortController();
+    const version = state.stopVersion;
+    state.startController = controller;
     try {
-      child = this.spawnProcess(processState.config.command, options);
+      await launchProcess(state, {
+        controller,
+        logger: this.logger,
+        spawnProcess: this.spawnProcess,
+        now: this.now,
+        assertDependenciesReady: () => this.assertDependenciesReady(state),
+        onExit: (child, code, signal) => {
+          if (state.child !== child) return;
+          state.lastExitCode = code;
+          state.lastSignal = signal;
+          if (state.state === "running") state.state = "stopped";
+        },
+        onClose: (child, code, signal) => {
+          if (state.child === child) this.handleClose(state, code, signal);
+        }
+      });
     } catch (error) {
-      this.markSpawnFailure(processState, error);
-      return this.toStatus(processState);
-    }
-
-    processState.child = child;
-    processState.pid = child.pid ?? null;
-    processState.lastStartedAt = this.now();
-
-    if (child.stdout) {
-      child.stdout.on("data", (chunk: Buffer) => {
-        this.logger.write(name, "stdout", chunk);
-      });
-    }
-
-    if (child.stderr) {
-      child.stderr.on("data", (chunk: Buffer) => {
-        this.logger.write(name, "stderr", chunk);
-      });
-    }
-
-    child.once("error", (error) => {
-      if (processState.child !== child) {
-        return;
+      if (!state.stopRequested && state.stopVersion === version && !this.shuttingDown) {
+        await this.handleStartFailure(state, version, error);
       }
+    } finally {
+      if (state.startController === controller) state.startController = null;
+    }
+    await this.stopPromises.get(state.name);
+    return this.toStatus(state);
+  }
 
-      this.markSpawnFailure(processState, error);
-    });
-
-    child.once("exit", (exitCode, signal) => {
-      if (processState.child !== child) {
-        return;
+  private assertDependenciesReady(state: ManagedProcess): void {
+    for (const name of state.config.dependsOn) {
+      const dependency = this.getProcessOrThrow(name);
+      if (dependency.state !== "running" || dependency.stopRequested || !dependency.child || !dependency.pid || hasExited(dependency.child)) {
+        throw new Error(`Dependency "${name}" is not ready. Start it before "${state.name}".`);
       }
+    }
+  }
 
-      this.handleExit(processState, exitCode, signal);
-    });
-
-    this.logger.lifecycle(name, `started pid=${processState.pid ?? "unknown"}`);
-    return this.toStatus(processState);
+  private async handleStartFailure(state: ManagedProcess, version: number, error: unknown): Promise<void> {
+    const attempts = state.restartAttempts;
+    const stopped = (!state.child && !state.treeCleanup) || await this.stopProcess(state);
+    if (!stopped || state.stopVersion !== version || this.shuttingDown) return;
+    state.restartAttempts = attempts;
+    state.lastStartedAt = null;
+    state.stopRequested = false;
+    state.state = "failed";
+    state.lastError = errorMessage(error);
+    this.logger.lifecycle(state.name, `failed to start: ${state.lastError}`, "stderr");
+    if (state.config.killOnExit) {
+      this.onFatalExit?.(state.name, this.toStatus(state));
+    } else if (state.config.restart !== "manual") {
+      this.scheduleRestart(state);
+    }
   }
 
   async stop(name: string): Promise<ProcessStatus> {
     const processState = this.getProcessOrThrow(name);
+    processState.stopVersion += 1;
     await this.stopProcess(processState);
+    await this.startPromises.get(name);
     return this.toStatus(processState);
   }
 
@@ -168,17 +179,29 @@ export class ProcessManager {
     if (this.shuttingDown) {
       throw new Error("Cannot restart processes while prwr is shutting down.");
     }
+    const pending = this.restartPromises.get(name);
+    if (pending?.version === processState.stopVersion) return pending.promise;
+    processState.stopVersion += 1;
+    const version = processState.stopVersion;
+    const promise = this.performRestart(processState, version).finally(() => {
+      if (this.restartPromises.get(name)?.promise === promise) this.restartPromises.delete(name);
+    });
+    this.restartPromises.set(name, { version, promise });
+    return promise;
+  }
 
-    this.logger.lifecycle(name, "restarting...");
+  private async performRestart(processState: ManagedProcess, version: number): Promise<ProcessStatus> {
+    this.logger.lifecycle(processState.name, "restarting...");
     processState.state = "restarting";
     processState.restartCount += 1;
     processState.restartAttempts = 0;
     const stopped = await this.stopProcess(processState);
+    await this.startPromises.get(processState.name);
     if (!stopped) {
-      throw new Error(`Process "${name}" did not stop cleanly; not restarting.`);
+      throw new Error(`Process "${processState.name}" did not stop cleanly; not restarting.`);
     }
-
-    return this.start(name);
+    if (processState.stopVersion !== version || this.shuttingDown) return this.toStatus(processState);
+    return this.start(processState.name);
   }
 
   async send(name: string, text: string): Promise<{ message: string }> {
@@ -207,8 +230,12 @@ export class ProcessManager {
   async stopAll(): Promise<boolean> {
     this.shuttingDown = true;
     const results = await Promise.all(
-      [...this.processes.values()].map((processState) => this.stopProcess(processState))
+      [...this.processes.values()].map((processState) => {
+        processState.stopVersion += 1;
+        return this.stopProcess(processState);
+      })
     );
+    await Promise.all([...this.startPromises.values()]);
     return results.every(Boolean);
   }
 
@@ -226,65 +253,23 @@ export class ProcessManager {
       return existing;
     }
 
-    const promise = this.performStop(processState).finally(() => {
+    const promise = stopProcessTree(processState, {
+      logger: this.logger,
+      killProcessTree: this.killProcessTree,
+      timeoutMs: this.stopTimeoutMs
+    }).finally(() => {
       this.stopPromises.delete(processState.name);
     });
     this.stopPromises.set(processState.name, promise);
     return promise;
   }
 
-  private async performStop(processState: ManagedProcess): Promise<boolean> {
-    clearRestartTimer(processState);
-    processState.stopRequested = true;
-
-    if (!processState.child || !processState.pid) {
-      processState.child = null;
-      processState.pid = null;
-      processState.state = "stopped";
-      processState.restartAttempts = 0;
-      processState.lastStartedAt = null;
-      return true;
-    }
-
-    const child = processState.child;
-    const pid = processState.pid;
-    const exitPromise = waitForExit(child, this.stopTimeoutMs);
-    let killError: string | null = null;
-
-    try {
-      await this.killProcessTree(pid);
-    } catch (error) {
-      killError = errorMessage(error);
-      this.logger.lifecycle(processState.name, `failed to stop pid=${pid}: ${killError}`, "stderr");
-    }
-
-    const exited = await exitPromise;
-
-    if (processState.child !== child) {
-      return true;
-    }
-
-    if (exited) {
-      processState.child = null;
-      processState.pid = null;
-      processState.state = "stopped";
-      processState.restartAttempts = 0;
-      processState.lastStartedAt = null;
-      return true;
-    }
-
-    processState.state = "failed";
-    processState.lastError =
-      killError ?? `Timed out waiting for process pid=${pid} to exit after stop request.`;
-    this.logger.lifecycle(processState.name, processState.lastError, "stderr");
-    return false;
-  }
-
-  private handleExit(
+  private handleClose(
     processState: ManagedProcess,
     exitCode: number | null,
     signal: NodeJS.Signals | null
   ): void {
+    const startupIncomplete = processState.state === "starting";
     this.logger.flush(processState.name);
     processState.child = null;
     processState.pid = null;
@@ -296,15 +281,14 @@ export class ProcessManager {
         ? `stopped exitCode=${exitCode ?? "null"}`
         : `stopped signal=${signal} exitCode=${exitCode ?? "null"}`;
     this.logger.lifecycle(processState.name, stoppedMessage);
-
-    const status = this.toStatus(processState);
+    if (startupIncomplete && !processState.stopRequested && !this.shuttingDown) return;
     const shouldTriggerFatal = processState.config.killOnExit && !processState.stopRequested;
     const shouldRestart =
       !this.shuttingDown && !processState.stopRequested && this.shouldRestart(processState, exitCode, signal);
 
     if (shouldTriggerFatal) {
       processState.state = "stopped";
-      this.onFatalExit?.(processState.name, status);
+      this.onFatalExit?.(processState.name, this.toStatus(processState));
       return;
     }
 
@@ -369,17 +353,6 @@ export class ProcessManager {
     return false;
   }
 
-  private markSpawnFailure(processState: ManagedProcess, error: unknown): void {
-    this.logger.flush(processState.name);
-    processState.child = null;
-    processState.pid = null;
-    processState.state = "failed";
-    processState.lastExitCode = null;
-    processState.lastSignal = null;
-    processState.lastError = errorMessage(error);
-    this.logger.lifecycle(processState.name, `failed to start: ${processState.lastError}`, "stderr");
-  }
-
   private getProcessOrThrow(name: string): ManagedProcess {
     const processState = this.processes.get(name);
     if (!processState) {
@@ -402,81 +375,4 @@ export class ProcessManager {
       lastError: processState.lastError
     };
   }
-}
-
-function clearRestartTimer(processState: ManagedProcess): void {
-  if (processState.restartTimer) {
-    clearTimeout(processState.restartTimer);
-    processState.restartTimer = null;
-  }
-}
-
-function shouldResetRestartAttempts(processState: ManagedProcess, now: number): boolean {
-  if (processState.config.restartBackoffResetMs <= 0 || processState.lastStartedAt === null) {
-    return false;
-  }
-
-  return now - processState.lastStartedAt >= processState.config.restartBackoffResetMs;
-}
-
-function restartDelayMs(
-  config: Pick<
-    ManagedProcess["config"],
-    "startupDelayMs" | "restartBackoffMs" | "restartBackoffMaxMs"
-  >,
-  attempt: number
-): number {
-  const baseDelay = config.restartBackoffMs > 0 ? config.restartBackoffMs : Math.max(100, config.startupDelayMs);
-  const backoffEnabled = config.restartBackoffMs > 0 || config.restartBackoffMaxMs > 0;
-  if (!backoffEnabled) {
-    return baseDelay;
-  }
-
-  const exponentialDelay = baseDelay * 2 ** Math.max(0, attempt - 1);
-  return config.restartBackoffMaxMs > 0
-    ? Math.min(config.restartBackoffMaxMs, exponentialDelay)
-    : exponentialDelay;
-}
-
-function writeToStdin(stdin: NonNullable<ChildProcess["stdin"]>, text: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    stdin.write(text, (error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-
-      resolve();
-    });
-  });
-}
-
-function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        resolve(false);
-      }
-    }, timeoutMs);
-
-    child.once("exit", () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        resolve(true);
-      }
-    });
-  });
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

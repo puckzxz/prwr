@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   colorForName,
   formatLocalTime,
@@ -16,6 +16,15 @@ class MemoryStream implements WritableStreamLike {
 }
 
 describe("PrefixedLogger", () => {
+  beforeEach(() => {
+    vi.stubEnv("NO_COLOR", undefined);
+    vi.stubEnv("FORCE_COLOR", undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("prefixes and pads complete lines", () => {
     const stdout = new MemoryStream();
     const logger = new PrefixedLogger({ names: ["gui", "backend"], stdout, colorMode: "never" });
@@ -34,6 +43,46 @@ describe("PrefixedLogger", () => {
     logger.flush("api", "stdout");
 
     expect(stdout.value).toBe("api | hello\napi | part\n");
+  });
+
+  it("preserves UTF-8 characters split across chunks on independent streams", () => {
+    const stdout = new MemoryStream();
+    const stderr = new MemoryStream();
+    const logger = new PrefixedLogger({ names: ["api"], stdout, stderr, colorMode: "never" });
+    const output = Buffer.from("ready \u{1F680}\n");
+    const error = Buffer.from("caf\u00e9");
+
+    logger.write("api", "stdout", output.subarray(0, 8));
+    logger.write("api", "stderr", error.subarray(0, 4));
+    logger.write("api", "stdout", output.subarray(8));
+    logger.write("api", "stderr", error.subarray(4));
+    logger.flush("api");
+
+    expect(stdout.value).toBe("api | ready \u{1F680}\n");
+    expect(stderr.value).toBe("api | caf\u00e9\n");
+  });
+
+  it("flushes incomplete UTF-8 once and resets decoding for the next run", () => {
+    const stdout = new MemoryStream();
+    const logger = new PrefixedLogger({ names: ["api"], stdout, colorMode: "never" });
+
+    logger.write("api", "stdout", Buffer.from([0xe2, 0x82]));
+    expect(stdout.value).toBe("");
+    logger.flush("api");
+    logger.flush("api");
+    logger.write("api", "stdout", Buffer.from("next\n"));
+
+    expect(stdout.value).toBe("api | \uFFFD\napi | next\n");
+  });
+
+  it("honors NO_COLOR even when label colors are forced", () => {
+    vi.stubEnv("NO_COLOR", "1");
+    const stdout = new MemoryStream();
+    const logger = new PrefixedLogger({ names: ["api"], stdout, colorMode: "always" });
+
+    logger.write("api", "stdout", "ready\n");
+
+    expect(stdout.value).toBe("api | ready\n");
   });
 
   it("colors only the prefix when forced", () => {

@@ -46,6 +46,9 @@ jobs:
       - name: Test
         run: pnpm test
 
+      - name: Check package contents
+        run: pnpm run pack:check
+
       - name: Smoke CLI help
         if: runner.os == 'Windows'
         run: node dist/cli.js --help

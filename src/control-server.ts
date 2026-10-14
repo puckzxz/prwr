@@ -1,5 +1,6 @@
 import net from "node:net";
-import type { ControlCommand, ControlResponse } from "./types.js";
+import { isControlEnvelope } from "./control-protocol.js";
+import type { ControlCommand, ControlEnvelope, ControlResponse } from "./types.js";
 
 export type ControlCommandHandler = (command: ControlCommand) => Promise<unknown> | unknown;
 
@@ -8,16 +9,13 @@ export interface ControlServerOptions {
   requestTimeoutMs?: number;
   maxRequestBytes?: number;
   maxResponseBytes?: number;
+  closeGraceMs?: number;
 }
 
 export const DEFAULT_CONTROL_REQUEST_TIMEOUT_MS = 5000;
 export const DEFAULT_MAX_CONTROL_REQUEST_BYTES = 64 * 1024;
 export const DEFAULT_MAX_CONTROL_RESPONSE_BYTES = 1024 * 1024;
-
-interface ControlEnvelope {
-  token: string;
-  command: ControlCommand;
-}
+export const DEFAULT_CONTROL_CLOSE_GRACE_MS = 1000;
 
 export class ControlServer {
   private readonly server: net.Server;
@@ -26,6 +24,10 @@ export class ControlServer {
   private readonly requestTimeoutMs: number;
   private readonly maxRequestBytes: number;
   private readonly maxResponseBytes: number;
+  private readonly closeGraceMs: number;
+  private readonly connections = new Set<net.Socket>();
+  private readonly pendingRequests = new Set<net.Socket>();
+  private closePromise: Promise<void> | null = null;
 
   constructor(handler: ControlCommandHandler, options: ControlServerOptions) {
     this.handler = handler;
@@ -33,7 +35,14 @@ export class ControlServer {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_CONTROL_REQUEST_TIMEOUT_MS;
     this.maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_CONTROL_REQUEST_BYTES;
     this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_CONTROL_RESPONSE_BYTES;
+    this.closeGraceMs = options.closeGraceMs ?? DEFAULT_CONTROL_CLOSE_GRACE_MS;
     this.server = net.createServer({ allowHalfOpen: true }, (socket) => {
+      this.connections.add(socket);
+      this.pendingRequests.add(socket);
+      socket.once("close", () => {
+        this.connections.delete(socket);
+        this.pendingRequests.delete(socket);
+      });
       let buffer = "";
       let receivedBytes = 0;
       let settled = false;
@@ -54,6 +63,7 @@ export class ControlServer {
       });
 
       socket.on("data", (chunk) => {
+        if (settled) return;
         receivedBytes += Buffer.byteLength(chunk, "utf8");
         if (receivedBytes > this.maxRequestBytes) {
           finish({ ok: false, error: "Control request is too large." });
@@ -64,6 +74,7 @@ export class ControlServer {
       });
 
       socket.on("end", () => {
+        this.pendingRequests.delete(socket);
         if (settled) {
           return;
         }
@@ -97,8 +108,15 @@ export class ControlServer {
   }
 
   async close(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = new Promise<void>((resolve, reject) => {
+      // Let completed commands drain their replies, but never rely on a peer to close.
+      const deadline = setTimeout(() => {
+        for (const socket of this.connections) socket.destroy();
+      }, this.closeGraceMs);
+      deadline.unref();
       this.server.close((error) => {
+        clearTimeout(deadline);
         if (error) {
           reject(error);
           return;
@@ -107,6 +125,8 @@ export class ControlServer {
         resolve();
       });
     });
+    for (const socket of this.pendingRequests) socket.destroy();
+    return this.closePromise;
   }
 
   private async handleSocketEnd(socket: net.Socket, rawPayload: string): Promise<void> {
@@ -115,12 +135,13 @@ export class ControlServer {
   }
 
   private writeResponse(socket: net.Socket, response: ControlResponse): void {
+    if (socket.destroyed) return;
     let payload = JSON.stringify(response);
     if (Buffer.byteLength(payload, "utf8") > this.maxResponseBytes) {
       payload = JSON.stringify({ ok: false, error: "Control response is too large." } satisfies ControlResponse);
     }
 
-    socket.end(`${payload}\n`);
+    socket.end(`${payload}\n`, () => socket.destroy());
   }
 
   private async dispatch(rawPayload: string): Promise<ControlResponse> {
@@ -146,18 +167,4 @@ export class ControlServer {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
-}
-
-function isControlEnvelope(value: unknown): value is ControlEnvelope {
-  return (
-    isRecord(value) &&
-    typeof value.token === "string" &&
-    value.token.length > 0 &&
-    isRecord(value.command) &&
-    typeof value.command.type === "string"
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

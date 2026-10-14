@@ -1,4 +1,6 @@
-import type { ColorMode } from "./types.js";
+import { StringDecoder } from "node:string_decoder";
+import { LogHistory, DEFAULT_LOG_TAIL } from "./log-history.js";
+import type { ColorMode, LogKind, LogStream, ProcessLogs } from "./types.js";
 
 export interface WritableStreamLike {
   isTTY?: boolean;
@@ -14,7 +16,7 @@ export interface PrefixedLoggerOptions {
   now?: () => Date;
 }
 
-type StreamKind = "stdout" | "stderr";
+type StreamKind = LogStream;
 
 const RESET = "\u001B[0m";
 const COLORS = [
@@ -39,7 +41,8 @@ export class PrefixedLogger {
   private readonly colorMode: ColorMode;
   private readonly timestamps: boolean;
   private readonly now: () => Date;
-  private readonly buffers = new Map<string, string>();
+  private readonly buffers = new Map<string, { text: string; decoder: StringDecoder }>();
+  private readonly history: LogHistory;
 
   constructor(options: PrefixedLoggerOptions) {
     this.stdout = options.stdout ?? process.stdout;
@@ -48,12 +51,14 @@ export class PrefixedLogger {
     this.timestamps = options.timestamps ?? false;
     this.now = options.now ?? (() => new Date());
     this.width = Math.max(1, ...options.names.map((name) => name.length));
+    this.history = new LogHistory(options.names);
   }
 
   write(name: string, stream: StreamKind, chunk: Buffer | string): void {
     const key = `${name}:${stream}`;
-    const previous = this.buffers.get(key) ?? "";
-    let text = previous + chunk.toString();
+    const buffer = this.buffers.get(key) ?? { text: "", decoder: new StringDecoder("utf8") };
+    const decoded = typeof chunk === "string" ? buffer.decoder.end() + chunk : buffer.decoder.write(chunk);
+    let text = buffer.text + decoded;
     let newlineIndex = text.indexOf("\n");
 
     while (newlineIndex !== -1) {
@@ -64,11 +69,12 @@ export class PrefixedLogger {
       newlineIndex = text.indexOf("\n");
     }
 
-    this.buffers.set(key, text);
+    buffer.text = text;
+    this.buffers.set(key, buffer);
   }
 
   lifecycle(name: string, message: string, stream: StreamKind = "stdout"): void {
-    this.writeLine(name, stream, message);
+    this.writeLine(name, stream, message, "lifecycle");
   }
 
   flush(name: string, stream?: StreamKind): void {
@@ -76,36 +82,27 @@ export class PrefixedLogger {
 
     for (const selectedStream of streams) {
       const key = `${name}:${selectedStream}`;
-      const buffered = this.buffers.get(key);
+      const buffer = this.buffers.get(key);
+      const buffered = buffer ? buffer.text + buffer.decoder.end() : "";
       if (buffered && buffered.length > 0) {
         this.writeLine(name, selectedStream, buffered);
       }
-      this.buffers.set(key, "");
+      this.buffers.delete(key);
     }
   }
 
-  private writeLine(name: string, stream: StreamKind, line: string): void {
+  getLogs(name: string, tail = DEFAULT_LOG_TAIL): ProcessLogs {
+    return { name, entries: this.history.get(name, tail) };
+  }
+
+  private writeLine(name: string, stream: StreamKind, line: string, kind: LogKind = "output"): void {
     const destination = stream === "stdout" ? this.stdout : this.stderr;
-    const timestamp = this.timestamps ? `${formatLocalTime(this.now())} ` : "";
+    const now = this.now();
+    this.history.add({ name, stream, kind, text: line, timestamp: now.toISOString() });
+    const timestamp = this.timestamps ? `${formatLocalTime(now)} ` : "";
     const prefix = `${name.padEnd(this.width)} | `;
-    const renderedPrefix = this.shouldColor(destination) ? colorForName(name, prefix) : prefix;
+    const renderedPrefix = shouldColorLabels(this.colorMode, destination) ? colorForName(name, prefix) : prefix;
     destination.write(`${timestamp}${renderedPrefix}${line}\n`);
-  }
-
-  private shouldColor(destination: WritableStreamLike): boolean {
-    if (process.env.NO_COLOR) {
-      return false;
-    }
-
-    if (this.colorMode === "always") {
-      return true;
-    }
-
-    if (this.colorMode === "never") {
-      return false;
-    }
-
-    return Boolean(destination.isTTY || process.env.FORCE_COLOR);
   }
 }
 
@@ -127,4 +124,20 @@ export function formatLocalTime(date: Date): string {
   return [date.getHours(), date.getMinutes(), date.getSeconds()]
     .map((value) => String(value).padStart(2, "0"))
     .join(":");
+}
+
+export function shouldColorLabels(colorMode: ColorMode, destination: WritableStreamLike): boolean {
+  if (process.env.NO_COLOR) {
+    return false;
+  }
+
+  if (colorMode === "always") {
+    return true;
+  }
+
+  if (colorMode === "never") {
+    return false;
+  }
+
+  return Boolean(destination.isTTY || process.env.FORCE_COLOR);
 }

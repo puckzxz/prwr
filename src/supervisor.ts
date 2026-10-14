@@ -11,15 +11,17 @@ import {
 } from "./control-client.js";
 import { PrefixedLogger } from "./logger.js";
 import { ProcessManager } from "./process-manager.js";
+import { selectProcesses } from "./process-graph.js";
 import type {
   ColorMode,
   ControlCommand,
   LoadedConfig,
+  ProcessSelection,
   SupervisorStateFile,
   SupervisorStatus
 } from "./types.js";
 
-export interface UpOptions {
+export interface UpOptions extends ProcessSelection {
   cwd: string;
   colorMode: ColorMode;
   timestamps: boolean;
@@ -31,12 +33,12 @@ export interface UpOptions {
 export type CheckOptions = Omit<UpOptions, "colorMode" | "timestamps">;
 
 export async function runUp(options: UpOptions): Promise<number> {
-  const config = loadConfig({
+  const config = selectProcesses(loadConfig({
     cwd: options.cwd,
     configPath: options.configPath,
     procfilePath: options.procfilePath,
     positionalPath: options.positionalPath
-  });
+  }), options);
 
   const existing = await readVerifiedSupervisorState(config.projectRoot);
   if (existing) {
@@ -58,12 +60,12 @@ export async function sendProjectCommand(
 }
 
 export async function runCheck(options: CheckOptions): Promise<number> {
-  const config = loadConfig({
+  const config = selectProcesses(loadConfig({
     cwd: options.cwd,
     configPath: options.configPath,
     procfilePath: options.procfilePath,
     positionalPath: options.positionalPath
-  });
+  }), options);
 
   validateProcessCwds(config);
   console.log(`prwr config ok: ${path.relative(options.cwd, config.configPath) || config.configPath}`);
@@ -148,13 +150,15 @@ async function runSupervisor(
         return manager.start(command.name);
       case "send":
         return manager.send(command.name, command.text);
+      case "logs":
+        return logger.getLogs(command.name, command.tail);
       case "down":
         setTimeout(() => {
           void shutdown(0);
         }, 0);
         return { message: "stopping prwr supervisor" };
       default:
-        throw new Error("Unknown control command.");
+        return assertNever(command);
     }
   }, { token });
 
@@ -168,7 +172,12 @@ async function runSupervisor(
     startedAt: new Date().toISOString()
   };
 
-  writeSupervisorState(state);
+  try {
+    writeSupervisorState(state);
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
 
   const onSignal = () => {
     void shutdown(0);
@@ -177,7 +186,12 @@ async function runSupervisor(
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
 
-  await manager.startAll();
+  try {
+    await manager.startAll();
+  } catch (error) {
+    await shutdown(1);
+    throw error;
+  }
   return exitPromise;
 }
 
@@ -201,4 +215,8 @@ function publicSupervisorState(state: SupervisorStateFile): Omit<SupervisorState
     port: state.port,
     startedAt: state.startedAt
   };
+}
+
+function assertNever(command: never): never {
+  throw new Error(`Unknown control command: ${String(command)}.`);
 }
