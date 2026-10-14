@@ -4,9 +4,18 @@ import net from "node:net";
 import { describe, expect, it, vi } from "vitest";
 import { waitForReadiness } from "../src/readiness.js";
 import { waitFor } from "./helpers/process-manager.js";
-import { close, listen, trackConnections, unusedPort } from "./helpers/readiness.js";
+import { close, listen, trackConnections, unusedPort, waitForRealTime } from "./helpers/readiness.js";
 
 describe("readiness probes", () => {
+  it("keeps fixture setup bounded while the readiness deadline clock is frozen", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      await expect(waitForRealTime(() => false, 25)).rejects.toThrow("Timed out waiting for fixture state.");
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("connects to TCP and closes the probe socket and abort listener", async () => {
     const server = net.createServer();
     const sockets = trackConnections(server);

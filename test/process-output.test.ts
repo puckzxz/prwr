@@ -11,7 +11,10 @@ describe("process output lifecycle", () => {
 
     try {
       await manager.start("api");
-      await waitFor(() => manager.getStatus()[0]?.state === "stopped");
+      await waitFor(() => {
+        const status = manager.getStatus()[0];
+        return status?.state === "stopped" && status.pid === null;
+      });
 
       expect(stdout.value).toContain("api | out-partial\n");
       expect(stderr.value).toContain("api | err-partial\n");

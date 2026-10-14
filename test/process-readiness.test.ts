@@ -2,10 +2,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { isPidAlive } from "../src/kill-tree.js";
 import { fakeChild, managerFor, nodeCommand, processConfig, waitFor } from "./helpers/process-manager.js";
-import { close, listen, trackConnections, unusedPort } from "./helpers/readiness.js";
+import { close, listen, observeProcessSpawns, trackConnections, unusedPort, waitForGrandchildOutput, waitForRealTime } from "./helpers/readiness.js";
 
 function readyTcp(port: number, timeoutMs = 3000) {
   return { type: "tcp" as const, host: "127.0.0.1", port, timeoutMs, intervalMs: 10 };
@@ -184,20 +184,31 @@ describe("process readiness and dependencies", () => {
 
   it("cleans a real tree and flushes partial output when readiness times out", async () => {
     const port = await unusedPort();
-    const { manager, stdout } = managerFor([processConfig({ command: treeCommand(), readyWhen: readyTcp(port, 700) })]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const { runs, spawnProcess } = observeProcessSpawns();
+    const { manager, stdout } = managerFor([processConfig({ command: treeCommand(), readyWhen: readyTcp(port, 700) })], { spawnProcess });
     try {
-      expect(await manager.start("api")).toMatchObject({ state: "failed", pid: null, lastError: "Readiness timed out after 700ms." });
+      const starting = manager.start("api");
+      const grandchild = await waitForGrandchildOutput(runs, 0);
+      expect(manager.getStatus()[0]?.state).toBe("starting");
+      // Advance the deadline only after the real descendant and full partial
+      // output exist, so machine-dependent Node startup speed cannot race it.
+      clock.mockReturnValue(700);
+      expect(await starting).toMatchObject({ state: "failed", pid: null, lastError: "Readiness timed out after 700ms." });
       const pids = grandchildren(stdout.value);
-      expect(pids).toHaveLength(1);
+      expect(pids).toEqual([grandchild]);
       expect(pids.every((pid) => !isPidAlive(pid))).toBe(true);
       expect(stdout.value).toContain("api | final-partial\n");
     } finally {
+      clock.mockRestore();
       await manager.stopAll();
     }
   });
 
   it("bounds automatic readiness retries without treating an unready lifetime as a stable run", async () => {
     const port = await unusedPort();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const { runs, spawnProcess } = observeProcessSpawns();
     const { manager, stdout } = managerFor([processConfig({
       command: treeCommand(),
       readyWhen: readyTcp(port, 700),
@@ -205,15 +216,23 @@ describe("process readiness and dependencies", () => {
       restartBackoffMs: 1,
       restartBackoffResetMs: 10,
       restartMaxAttempts: 1
-    })]);
+    })], { spawnProcess });
     try {
-      await manager.start("api");
-      await waitFor(() => manager.getStatus()[0]?.state === "failed");
+      const starting = manager.start("api");
+      const firstGrandchild = await waitForGrandchildOutput(runs, 0);
+      clock.mockReturnValue(700);
+      await starting;
+      const secondGrandchild = await waitForGrandchildOutput(runs, 1);
+      expect(isPidAlive(firstGrandchild)).toBe(false);
+      expect(manager.getStatus()[0]?.state).toBe("starting");
+      clock.mockReturnValue(1400);
+      await waitForRealTime(() => manager.getStatus()[0]?.state === "failed");
       expect(manager.getStatus()[0]).toMatchObject({ pid: null, restartCount: 1, lastError: "Restart limit reached after 1 attempt." });
       const pids = grandchildren(stdout.value);
-      expect(pids).toHaveLength(2);
+      expect(pids).toEqual([firstGrandchild, secondGrandchild]);
       expect(pids.every((pid) => !isPidAlive(pid))).toBe(true);
     } finally {
+      clock.mockRestore();
       await manager.stopAll();
     }
   });
