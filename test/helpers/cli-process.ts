@@ -46,6 +46,9 @@ export class CliTestHarness {
       child.once("error", reject);
       child.once("close", (code, signal) => {
         closed = true;
+        // Windows can reuse a finished PID for a later test worker. POSIX groups
+        // may still contain children after their leader exits, so retain those.
+        if (process.platform === "win32" && child.pid) this.processTrees.delete(child.pid);
         resolve({ code, signal, stdout, stderr });
       });
     });
@@ -69,6 +72,12 @@ export class CliTestHarness {
 
   trackDescendant(pid: number): void {
     if (pid > 0) this.descendants.add(pid);
+  }
+
+  // Call only after the fixture has established that this process stopped.
+  forgetPid(pid: number): void {
+    this.processTrees.delete(pid);
+    this.descendants.delete(pid);
   }
 
   async cleanup(): Promise<void> {
