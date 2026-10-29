@@ -1,5 +1,6 @@
 import path from "node:path";
 import { colorForName, shouldColorLabels } from "./logger.js";
+import { DEFAULT_WAIT_TIMEOUT_MS } from "./process-wait.js";
 import type { ColorMode, ProcessLogs, SupervisorStatus } from "./types.js";
 
 export function printUsage(): void {
@@ -9,6 +10,7 @@ export function printUsage(): void {
   prwr ./.prwr.yml
   prwr ./Procfile.dev
   prwr status [--json]
+  prwr wait [<name> ...] [--timeout <ms>] [--json]
   prwr logs <name> [--tail [N]] [--color|--no-color]
   prwr restart <name>
   prwr stop <name>
@@ -20,7 +22,10 @@ export function printUsage(): void {
 Labels are colored by default. Use --no-color or NO_COLOR=1 to disable label colors.
 Use --timestamps to prefix live log lines with local HH:mm:ss timestamps.
 Selection accepts comma-separated names and repeated flags. Dependencies are included automatically.
-Logs show recent timestamped output; --tail defaults to 50 entries.`);
+Logs show recent timestamped output; --tail defaults to 50 entries.
+Use --config <path> before or after any command to target its config directory.
+Wait observes startup state without starting processes; its timeout defaults to ${DEFAULT_WAIT_TIMEOUT_MS}ms.
+Use -- before literal process names or send text that look like options.`);
 }
 
 export function printStatus(status: SupervisorStatus): void {

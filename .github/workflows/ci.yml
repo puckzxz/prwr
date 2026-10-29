@@ -19,6 +19,7 @@ jobs:
           - 20
           - 22
           - 24
+          - 26
 
     steps:
       - name: Checkout
@@ -52,6 +53,10 @@ jobs:
       - name: Smoke CLI help
         if: runner.os == 'Windows'
         run: node dist/cli.js --help
+
+      - name: Smoke CLI wait JSON timeout
+        run: |
+          node --input-type=module -e "import assert from 'node:assert/strict'; import { spawnSync } from 'node:child_process'; const result = spawnSync(process.execPath, ['dist/cli.js', 'wait', '--timeout', '50', '--json'], { encoding: 'utf8' }); assert.equal(result.status, 1); assert.equal(result.stderr, ''); const output = JSON.parse(result.stdout); assert.equal(output.ok, false); assert.match(output.error, /Timed out after 50ms/);"
 
       - name: Smoke CLI status failure
         if: runner.os == 'Windows'

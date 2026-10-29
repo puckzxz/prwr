@@ -11,7 +11,8 @@ import {
   stateFilePath,
   writeSupervisorState
 } from "../src/control-client.js";
-import type { ControlCommand, ControlResponse, SupervisorIdentity, SupervisorStateFile } from "../src/types.js";
+import type { ControlCommand, ControlResponse } from "../src/types.js";
+import { identityFor, stateFor } from "./helpers/control.js";
 
 describe("control client state", () => {
   it("removes stale supervisor state files", () => {
@@ -234,26 +235,6 @@ describe("control client state", () => {
     }
   });
 });
-
-function stateFor(dir: string, port: number, token: string): SupervisorStateFile {
-  return {
-    supervisorPid: process.pid,
-    projectRoot: dir,
-    configPath: path.join(dir, ".prwr.yml"),
-    port,
-    token,
-    startedAt: new Date().toISOString()
-  };
-}
-
-function identityFor(state: SupervisorStateFile): SupervisorIdentity {
-  return {
-    supervisorPid: state.supervisorPid,
-    projectRoot: state.projectRoot,
-    configPath: state.configPath,
-    startedAt: state.startedAt
-  };
-}
 
 async function sendEnvelope(
   port: number,

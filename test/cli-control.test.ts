@@ -128,4 +128,64 @@ describe("CLI feature execution", () => {
     await expect(main([command, "web"])).resolves.toBe(1);
     expect(console.error).toHaveBeenCalledWith(`Failed to ${command} "web": Readiness check timed out.`);
   });
+
+  it.each([
+    { args: ["status", "--json"], command: { type: "status" }, data: status },
+    { args: ["down"], command: { type: "down" }, data: { message: "stopping" } },
+    { args: ["start", "web"], command: { type: "start", name: "web" }, data: processStatus },
+    { args: ["stop", "web"], command: { type: "stop", name: "web" }, data: processStatus },
+    { args: ["restart", "web"], command: { type: "restart", name: "web" }, data: processStatus },
+    { args: ["send", "web", "rs"], command: { type: "send", name: "web", text: "rs" }, data: {} },
+    { args: ["logs", "web", "--tail", "0"], command: { type: "logs", name: "web", tail: 0 }, data: { name: "web", entries: [] } }
+  ])("forwards config targeting for $command.type", async ({ args, command, data }) => {
+    vi.mocked(sendProjectCommand).mockResolvedValue({ ok: true, data });
+    await expect(main(["--config", "../app/.prwr.yml", ...args])).resolves.toBe(0);
+    expect(sendProjectCommand).toHaveBeenCalledWith(process.cwd(), command, { configPath: "../app/.prwr.yml" });
+  });
+
+  it.each(["status", "wait"])("keeps malformed global options machine readable for %s", async (command) => {
+    await expect(main(["--config=", command, "--json"])).resolves.toBe(1);
+    expect(JSON.parse(vi.mocked(console.log).mock.calls[0]![0] as string)).toEqual({
+      ok: false, error: "Option --config requires a nonempty path."
+    });
+    expect(sendProjectCommand).not.toHaveBeenCalled();
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("prints readiness success with JSON mode %s", async (json) => {
+    const sigint = process.listenerCount("SIGINT");
+    const sigterm = process.listenerCount("SIGTERM");
+    vi.mocked(sendProjectCommand).mockResolvedValue({ ok: true, data: {
+      ...status, supervisor: { ...status.supervisor, token: "private-token" },
+      processes: [{ ...processStatus, env: { SECRET: "private-environment" } }]
+    } });
+    await expect(main(["wait", "web", "--config", "app.yml", ...(json ? ["--json"] : [])])).resolves.toBe(0);
+    expect(console.log).toHaveBeenCalledTimes(1);
+    expect(console.log).toHaveBeenCalledWith(json ? JSON.stringify(status) : "prwr ready: web");
+    expect(sendProjectCommand).toHaveBeenCalledWith(process.cwd(), { type: "status" }, {
+      configPath: "app.yml", signal: expect.any(AbortSignal)
+    });
+    expect(process.listenerCount("SIGINT")).toBe(sigint);
+    expect(process.listenerCount("SIGTERM")).toBe(sigterm);
+  });
+
+  it("prints one JSON wait failure without environment or token fields", async () => {
+    vi.mocked(sendProjectCommand).mockResolvedValue({ ok: true, data: { ...status, processes: [{ ...processStatus, state: "failed", lastError: "Readiness timed out." }] } });
+    await expect(main(["wait", "web", "--json"])).resolves.toBe(1);
+    expect(console.log).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ ok: false, error: 'Process "web" failed: Readiness timed out.' }));
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each(["SIGINT", "SIGTERM"] as const)("cancels a wait on %s and removes its signal handlers", async (signal) => {
+    const before = process.listenerCount(signal);
+    vi.mocked(sendProjectCommand).mockImplementation((_cwd, _command, options) => new Promise((_resolve, reject) => {
+      options!.signal!.addEventListener("abort", () => reject(options!.signal!.reason), { once: true });
+    }));
+    const waiting = main(["wait", "web", "--json"]);
+    process.emit(signal);
+    await expect(waiting).resolves.toBe(1);
+    expect(console.log).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ ok: false, error: "prwr wait interrupted." }));
+    expect(process.listenerCount(signal)).toBe(before);
+    expect(sendProjectCommand).toHaveBeenCalledTimes(1);
+  });
 });

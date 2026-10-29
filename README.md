@@ -49,6 +49,7 @@ From another terminal in the same folder:
 ```powershell
 prwr status
 prwr status --json
+prwr wait backend web
 prwr logs backend --tail 100
 prwr restart backend
 prwr send web rs
@@ -76,7 +77,29 @@ prwr up --config .\.prwr.yml
 prwr up --procfile .\Procfile.dev
 ```
 
-Runtime state is stored in `.prwr/supervisor.json` inside the config file's directory. Run control commands from that directory so they can find the supervisor.
+Runtime state is stored in `.prwr/supervisor.json` inside the config file's directory. Control commands use the current directory by default. Pass `--config <path>` to target a supervisor from another directory:
+
+```powershell
+prwr up --config .\project\.prwr.yml
+# From another terminal, including outside the project:
+prwr --config .\project\.prwr.yml status --json
+prwr logs backend --config .\project\.prwr.yml --tail 100
+prwr restart backend --config .\project\.prwr.yml
+prwr down --config .\project\.prwr.yml
+```
+
+`--config` accepts a relative or absolute path, with either `--config <path>` or `--config=<path>`, before or after the command. Relative paths resolve from the calling shell. It is supported by `up`, `check`, `wait`, and every control command. For a Procfile supervisor, use its original path, for example `prwr status --config .\project\Procfile.dev`.
+
+Control commands and `wait` resolve the target directory and verify that the running supervisor uses the requested config path. A different config file in the same directory is an error; one supervisor can run per config directory. These commands do not reload YAML, Procfiles, or environment files, so they still work after those inputs are edited or removed. `up` and `check` continue to load and validate their inputs normally.
+
+Put targeting options before `--` when passing literal names or input that look like options:
+
+```powershell
+prwr send web --config .\project\.prwr.yml -- --config child-settings.json
+prwr stop --config .\project\.prwr.yml -- --config
+```
+
+The first example sends `--config child-settings.json` to `web`; the second stops a process literally named `--config`.
 
 Control commands verify the supervisor's identity before using that state. Identity checks and most commands wait up to five seconds for a response; `start` and `restart` wait up to 60 seconds. A longer operation can continue after the client reports a timeout. Supervisor state is preserved when a live supervisor cannot be reached, so check `prwr status` before retrying a start or restart.
 
@@ -214,6 +237,33 @@ A readiness timeout stops the newly started process tree and records a startup f
 
 These are startup gates. They do not monitor health after startup or cascade stops and restarts to already running dependents. `prwr check` validates configuration, dependency structure, selected working directories, and supervisor state; it does not run commands or probe readiness endpoints.
 
+## Waiting For Startup
+
+Use `prwr wait` from another terminal or a script to wait for startup readiness:
+
+```powershell
+prwr wait
+prwr wait backend web --timeout 60000
+prwr wait backend --config .\project\.prwr.yml --timeout 30000 --json
+```
+
+With no names, it waits for every process selected by the running supervisor, including dependencies. With names, it waits only for those processes. A process is ready when its state is `running`: its configured `readyWhen` startup check has passed, or spawning succeeded when no readiness check is configured. `wait` observes supervisor state; it does not start processes or perform new health probes.
+
+The default total timeout is 30,000 milliseconds. `--timeout <ms>` and `--timeout=<ms>` accept an integer from `1` through `2147483647`; `0` does not mean unlimited. The deadline covers waiting for a supervisor to appear, identity verification, status requests, and polling. A wait can start before `up`, which avoids startup races in scripts. Once it observes a supervisor, that supervisor stopping or being replaced fails the wait.
+
+Success exits with code `0` and prints `prwr ready: backend, web`. Unknown process names, a process in `failed` state, a wrong config target, transport errors, interruption, or timeout exit with code `1`. Processes that are `starting`, `restarting`, or `stopped` keep the wait pending until they run or the deadline expires. Timeout errors include the last observed pending states. Ctrl+C cancels the wait and closes its control connection without stopping the supervisor or its children.
+
+`--json` prints exactly one document to stdout on completion, with no progress messages. Success uses the same public `supervisor` and `processes` snapshot as `status --json`, including processes outside the requested names. Failure uses `{"ok":false,"error":"..."}`. Supervisor tokens and environment mappings are excluded, and JSON failures leave stderr empty.
+
+For example, gate an end-to-end test run in PowerShell:
+
+```powershell
+# Start prwr up in another terminal first, or launch it separately from your script.
+prwr wait backend web --config .\project\.prwr.yml --timeout 60000
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+pnpm exec playwright test
+```
+
 ## Machine-Readable Status
 
 Use JSON status from scripts or other tools:
@@ -267,12 +317,15 @@ Procfile commands run from the Procfile directory and use manual restart behavio
 | `prwr up [--only <names>] [--exclude <names>]` | Start the project, optionally selecting processes and their required dependencies. |
 | `prwr check [--only <names>] [--exclude <names>]` | Validate config, selected working directories, and supervisor state without starting processes. |
 | `prwr status [--json]` | Show supervisor and process state, optionally as JSON. |
+| `prwr wait [<name> ...] [--timeout <ms>] [--json]` | Wait for named processes, or all supervisor processes, to reach startup readiness. |
 | `prwr logs <name> [--tail [N]]` | Print a snapshot of recent output and lifecycle events. |
 | `prwr restart <name>` | Kill one process tree and start it again. |
 | `prwr stop <name>` | Stop one process. |
 | `prwr start <name>` | Start one stopped process. |
 | `prwr send <name> <text>` | Send one newline-terminated input command to a process with `stdin: true`. |
 | `prwr down` | Stop every process tree and exit the supervisor. |
+
+`up`, `check`, `wait`, and all control commands accept `--config <path>` before or after the command. Put it before `--` when using literal arguments.
 
 ## Windows Behavior
 
@@ -321,6 +374,8 @@ pnpm test
 pnpm run pack:check
 node dist/cli.js --help
 ```
+
+CI runs the full checks on Windows and Ubuntu with Node 20, 22, 24, and 26. Node 20 remains a legacy compatibility target; use a [maintained Node.js LTS release](https://nodejs.org/en/about/previous-releases) for development.
 
 ## Release Process
 

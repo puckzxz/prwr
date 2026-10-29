@@ -58,8 +58,8 @@ function descendants(project: string): number[] {
   return existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split(/\r?\n/).filter(Boolean).map(Number) : [];
 }
 
-async function status(harness: CliTestHarness, project: string): Promise<SupervisorStatus> {
-  const result = await harness.run(project, ["status", "--json"]);
+async function status(harness: CliTestHarness, cwd: string, configPath: string): Promise<SupervisorStatus> {
+  const result = await harness.run(cwd, ["status", "--json", "--config", configPath]);
   expect(result.code, result.stderr).toBe(0);
   expect(result.stderr).toBe("");
   const parsed = JSON.parse(result.stdout) as SupervisorStatus;
@@ -72,6 +72,8 @@ describe("source CLI feature integration", () => {
   it("runs selected dependency trees with env files, readiness, JSON status, input, replay and full cleanup", async () => {
     const harness = new CliTestHarness({ PRWR_INTEGRATION_SECRET: undefined, PRWR_INTEGRATION_PORT: undefined });
     const fixture = makeFixture(harness, await unusedPort());
+    const control = (args: string[]) => harness.run(harness.root, ["--config", path.relative(harness.root, fixture.configPath), ...args]);
+    const waiting = harness.start(harness.root, ["wait", "--config", fixture.configPath, "--timeout", "20000", "--json"]);
     const supervisor = harness.start(harness.root, ["up", "--config", fixture.configPath, "--only", "web", "--exclude", "excluded", "--no-color"]);
     const observedPids = new Set<number>();
     try {
@@ -82,18 +84,27 @@ describe("source CLI feature integration", () => {
         throw new Error(`${String(error)}\n${supervisor.stdout}\n${supervisor.stderr}`);
       });
       expect(existsSync(path.join(fixture.project, "dependent-started"))).toBe(false);
-      const pending = await status(harness, fixture.project);
+      const pending = await status(harness, harness.root, fixture.configPath);
       expect(pending.processes.map(({ name, state }) => ({ name, state }))).toEqual([
         { name: "db", state: "starting" }, { name: "web", state: "stopped" }
       ]);
       expect(JSON.parse(readFileSync(path.join(fixture.service, "db-env.json"), "utf8")))
         .toEqual({ secret: fixture.secret, cwd: fixture.service });
+      expect(waiting.closed, waiting.stderr || waiting.stdout).toBe(false);
+      const timeout = await control(["wait", "db", "--timeout", "200", "--json"]);
+      expect(timeout).toMatchObject({ code: 1, stderr: "" });
+      expect(JSON.parse(timeout.stdout)).toMatchObject({ ok: false, error: expect.stringContaining("Timed out after 200ms") });
+      expect(isPidAlive(pending.processes[0]!.pid!)).toBe(true);
+      expect(existsSync(stateFilePath(fixture.project))).toBe(true);
 
       writeFileSync(path.join(fixture.service, "allow-ready"), "ready");
       await waitFor(() => supervisor.stdout.includes("web-started"), 10000);
       expect(readFileSync(path.join(fixture.project, "dependent-started"), "utf8")).toBe(fixture.secret);
       expect(existsSync(path.join(fixture.project, "excluded-started"))).toBe(false);
-      const ready = await status(harness, fixture.project);
+      const waitResult = await within(waiting.completion, 10000, "Wait did not observe startup readiness.");
+      expect(waitResult).toMatchObject({ code: 0, stderr: "" });
+      const ready = await status(harness, harness.root, fixture.configPath);
+      expect(JSON.parse(waitResult.stdout)).toEqual(ready);
       expect(ready.processes.map(({ name, state }) => ({ name, state }))).toEqual([
         { name: "db", state: "running" }, { name: "web", state: "running" }
       ]);
@@ -111,19 +122,19 @@ describe("source CLI feature integration", () => {
       expect(descendants(fixture.project)).toHaveLength(2);
       expect(descendants(fixture.project).every((pid) => Number.isInteger(pid) && pid > 0 && isPidAlive(pid))).toBe(true);
 
-      expect((await harness.run(fixture.project, ["send", "db", "ping"])).code).toBe(0);
+      expect((await control(["send", "db", "ping"])).code).toBe(0);
       await waitFor(() => supervisor.stdout.includes("input:ping"));
-      const tail = await harness.run(fixture.project, ["logs", "db", "--tail", "1", "--no-color"]);
+      const tail = await control(["logs", "db", "--tail", "1", "--no-color"]);
       expect(tail.code, tail.stderr).toBe(0);
       expect(tail.stdout).toMatch(/^\d{4}-\d{2}-\d{2}T\S+ db \| input:ping\r?\n$/);
       expect(tail.stderr).toBe("");
-      expect(await harness.run(fixture.project, ["logs", "db", "--tail", "1", "--no-color"])).toEqual(tail);
-      const empty = await harness.run(fixture.project, ["logs", "db", "--tail", "0", "--no-color"]);
+      expect(await control(["logs", "db", "--tail", "1", "--no-color"])).toEqual(tail);
+      const empty = await control(["logs", "db", "--tail", "0", "--no-color"]);
       expect(empty).toMatchObject({ code: 0, stdout: "", stderr: "" });
 
       const firstGrandchild = descendants(fixture.project)[0]!;
-      expect((await harness.run(fixture.project, ["restart", "db"])).code).toBe(0);
-      const restarted = await status(harness, fixture.project);
+      expect((await control(["restart", "db"])).code).toBe(0);
+      const restarted = await status(harness, harness.root, fixture.configPath);
       expect(restarted.processes[0]).toMatchObject({ name: "db", state: "running", restartCount: 1 });
       expect(restarted.processes[0]!.pid).not.toBe(ready.processes[0]!.pid);
       expect(isPidAlive(firstGrandchild)).toBe(false);
@@ -131,16 +142,25 @@ describe("source CLI feature integration", () => {
       for (const pid of descendants(fixture.project)) { observedPids.add(pid); harness.trackDescendant(pid); }
       expect(descendants(fixture.project)).toHaveLength(3);
       expect(descendants(fixture.project).slice(1).every((pid) => Number.isInteger(pid) && pid > 0 && isPidAlive(pid))).toBe(true);
-      const replay = await harness.run(fixture.project, ["logs", "db", "--tail", "1000", "--no-color"]);
+      const replay = await control(["logs", "db", "--tail", "1000", "--no-color"]);
       expect(replay.code).toBe(0);
       expect(replay.stderr).toMatch(/\d{4}-\d{2}-\d{2}T\S+ db \| stderr-final-partial\r?\n/);
       expect(replay.stdout).toContain("input:ping");
 
-      expect((await harness.run(fixture.project, ["down"])).code).toBe(0);
+      expect((await control(["stop", "web"])).code).toBe(0);
+      expect((await status(harness, harness.root, fixture.configPath)).processes[1]).toMatchObject({ state: "stopped", pid: null });
+      expect(isPidAlive(ready.processes[1]!.pid!)).toBe(false);
+      expect((await control(["start", "web"])).code).toBe(0);
+      expect((await control(["wait", "web"]))).toMatchObject({ code: 0, stdout: "prwr ready: web\n", stderr: "" });
+      const started = await status(harness, harness.root, fixture.configPath);
+      observedPids.add(started.processes[1]!.pid!);
+      for (const pid of descendants(fixture.project)) { observedPids.add(pid); harness.trackDescendant(pid); }
+
+      expect((await control(["down"])).code).toBe(0);
       expect((await within(supervisor.completion, 10000, "Supervisor did not finish after down.")).code).toBe(0);
       expect(existsSync(stateFilePath(fixture.project))).toBe(false);
       expect([...observedPids].filter((pid) => isPidAlive(pid))).toEqual([]);
-      const stopped = await harness.run(fixture.project, ["status", "--json"]);
+      const stopped = await control(["status", "--json"]);
       expect(stopped).toMatchObject({ code: 1, stderr: "" });
       expect(JSON.parse(stopped.stdout)).toEqual({ ok: false, error: "prwr supervisor is not running for this project." });
     } finally {

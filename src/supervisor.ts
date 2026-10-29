@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { loadConfig } from "./config.js";
+import { loadConfig, resolveConfigTarget } from "./config.js";
 import { ControlServer } from "./control-server.js";
 import {
   readVerifiedSupervisorState,
@@ -15,6 +15,7 @@ import { selectProcesses } from "./process-graph.js";
 import type {
   ColorMode,
   ControlCommand,
+  ProjectCommandOptions,
   LoadedConfig,
   ProcessSelection,
   SupervisorStateFile,
@@ -54,9 +55,11 @@ export async function runUp(options: UpOptions): Promise<number> {
 
 export async function sendProjectCommand(
   cwd: string,
-  command: ControlCommand
+  command: ControlCommand,
+  options: ProjectCommandOptions = {}
 ): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
-  return sendControlCommand(cwd, command);
+  const target = options.configPath ? resolveConfigTarget(cwd, options.configPath) : { projectRoot: cwd, configPath: undefined };
+  return sendControlCommand(target.projectRoot, command, { expectedConfigPath: target.configPath, signal: options.signal });
 }
 
 export async function runCheck(options: CheckOptions): Promise<number> {

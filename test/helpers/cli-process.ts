@@ -73,14 +73,16 @@ export class CliTestHarness {
 
   async cleanup(): Promise<void> {
     for (const pid of this.processTrees) {
-      const alive = process.platform === "win32" ? isPidAlive(pid) : isProcessGroupAlive(pid);
-      if (alive) await killTree(pid);
+      await cleanupTree(pid);
     }
     // Descendants come only from this fixture's PID file; also clean up if a failed supervisor orphaned one.
     for (const pid of this.descendants) {
       if (isPidAlive(pid)) {
-        if (process.platform === "win32") await killTree(pid);
-        else process.kill(pid, "SIGKILL");
+        if (process.platform === "win32") await cleanupTree(pid);
+        else {
+          try { process.kill(pid, "SIGKILL"); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+        }
       }
     }
     for (const running of this.running) {
@@ -91,6 +93,17 @@ export class CliTestHarness {
       throw new Error(`Refusing to remove a fixture outside the temporary directory: ${this.root}`);
     }
     rmSync(this.root, { recursive: true, force: true });
+  }
+}
+
+async function cleanupTree(pid: number): Promise<void> {
+  const alive = () => process.platform === "win32" ? isPidAlive(pid) : isProcessGroupAlive(pid);
+  if (!alive()) return;
+  try {
+    await killTree(pid);
+  } catch (error) {
+    // A fixture can exit between the liveness check and taskkill. Keep real cleanup failures visible.
+    if (alive()) throw error;
   }
 }
 

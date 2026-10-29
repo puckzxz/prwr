@@ -1,6 +1,7 @@
 import { DEFAULT_LOG_TAIL, isLogTail, MAX_LOG_TAIL } from "./log-history.js";
 import { PUBLIC_CONTROL_COMMAND_TYPES, type PublicControlCommandType } from "./control-protocol.js";
-import type { ColorMode, ControlCommand, ProcessSelection } from "./types.js";
+import { DEFAULT_WAIT_TIMEOUT_MS, validateWaitTimeout } from "./process-wait.js";
+import type { ColorMode, ControlCommand, ProcessSelection, ProcessWaitOptions } from "./types.js";
 
 interface ConfigOptions extends ProcessSelection {
   configPath?: string;
@@ -11,59 +12,79 @@ interface ConfigOptions extends ProcessSelection {
 export type CliCommand =
   | ({ type: "up"; colorMode: ColorMode; timestamps: boolean } & ConfigOptions)
   | ({ type: "check" } & ConfigOptions)
-  | { type: "control"; colorMode: ColorMode; command: ControlCommand; json?: boolean }
+  | { type: "control"; colorMode: ColorMode; command: ControlCommand; json?: boolean; configPath?: string }
+  | ({ type: "wait"; json: boolean } & ProcessWaitOptions)
   | { type: "help" }
   | { type: "version" };
 
 const CONTROL_COMMANDS: ReadonlySet<string> = new Set(PUBLIC_CONTROL_COMMAND_TYPES);
 
 export function parseCliArgs(argv: string[]): CliCommand {
-  const { args, colorMode, timestamps } = parseGlobalFlags(argv);
+  const { args, colorMode, timestamps, configPath } = parseGlobalFlags(argv);
   const [command, ...rest] = args;
+  const target = configPath === undefined ? {} : { configPath };
 
   if (command === "--help" || command === "-h" || command === "help") return { type: "help" };
   if (command === "--version" || command === "-v" || command === "version") return { type: "version" };
   if (command === "up" || command === "check") {
     const options = parseUpOptions(rest);
-    return command === "up" ? { type: "up", colorMode, timestamps, ...options } : { type: "check", ...options };
+    return command === "up" ? { type: "up", colorMode, timestamps, ...options, ...target } : { type: "check", ...options, ...target };
   }
+  if (command === "wait") return { type: "wait", ...parseWaitOptions(rest), ...target };
 
   if (isPublicControlCommand(command)) {
-    const json = command === "status" && rest.includes("--json");
-    const controlArgs = json ? rest.filter((arg) => arg !== "--json") : rest;
+    const { args: controlArgs, json } = command === "status" ? extractJsonFlag(rest) : { args: rest, json: false };
     return {
-      type: "control", colorMode, command: parseControlCommand(command, controlArgs),
+      type: "control", colorMode, command: parseControlCommand(command, controlArgs), ...target,
       ...(json ? { json: true } : {})
     };
   }
 
-  return { type: "up", colorMode, timestamps, ...parseUpOptions(args) };
+  return { type: "up", colorMode, timestamps, ...parseUpOptions(args), ...target };
 }
 
 function isPublicControlCommand(command: string | undefined): command is PublicControlCommandType {
   return command !== undefined && CONTROL_COMMANDS.has(command);
 }
 
-export function isJsonStatusRequest(argv: string[]): boolean {
-  const { args } = parseGlobalFlags(argv);
-  return args[0] === "status" && args.includes("--json");
+export function isJsonRequest(argv: string[]): boolean {
+  // Detect error-output mode even when malformed global options prevent parsing.
+  let command: string | undefined;
+  let json = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
+    if (arg === "--") break;
+    if (arg === "--json") json = true;
+    else if (arg === "--color" || arg === "--no-color" || arg === "--timestamps" || arg.startsWith("--config=")) continue;
+    else if (arg === "--config") {
+      if (argv[index + 1] && !argv[index + 1]!.startsWith("--")) index += 1;
+    } else command ??= arg;
+  }
+  return (command === "status" || command === "wait") && json;
 }
 
-function parseGlobalFlags(argv: string[]): { args: string[]; colorMode: ColorMode; timestamps: boolean } {
+function parseGlobalFlags(argv: string[]): { args: string[]; colorMode: ColorMode; timestamps: boolean; configPath?: string } {
   const args: string[] = [];
   let colorMode: ColorMode = "always";
   let timestamps = false;
+  let configPath: string | undefined;
   let literal = false;
 
-  for (const arg of argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
     if (arg === "--") literal = true;
     if (!literal && arg === "--color") colorMode = "always";
     else if (!literal && arg === "--no-color") colorMode = "never";
     else if (!literal && arg === "--timestamps") timestamps = true;
-    else args.push(arg);
+    else if (!literal && (arg === "--config" || arg.startsWith("--config="))) {
+      if (configPath !== undefined) throw new Error("Option --config may only be specified once.");
+      configPath = arg === "--config" ? requireValue(argv, index, arg) : arg.slice("--config=".length);
+      if (arg === "--config") index += 1;
+      if (!configPath.trim()) throw new Error("Option --config requires a nonempty path.");
+    } else args.push(arg);
   }
 
-  return { args, colorMode, timestamps };
+  return { args, colorMode, timestamps, configPath };
 }
 
 function parseUpOptions(args: string[]): ConfigOptions {
@@ -74,8 +95,8 @@ function parseUpOptions(args: string[]): ConfigOptions {
     const arg = args[index]!;
     if (!literal && arg === "--") {
       literal = true;
-    } else if (!literal && (arg === "--config" || arg === "--procfile")) {
-      options[arg === "--config" ? "configPath" : "procfilePath"] = requireValue(args, index, arg);
+    } else if (!literal && arg === "--procfile") {
+      options.procfilePath = requireValue(args, index, arg);
       index += 1;
     } else if (!literal && (arg === "--only" || arg === "--exclude" || arg.startsWith("--only=") || arg.startsWith("--exclude="))) {
       const equals = arg.indexOf("=");
@@ -94,6 +115,40 @@ function parseUpOptions(args: string[]): ConfigOptions {
   }
 
   return options;
+}
+
+function extractJsonFlag(args: string[]): { args: string[]; json: boolean } {
+  let literal = false;
+  let json = false;
+  const remaining = args.filter((arg) => {
+    if (arg === "--") literal = true;
+    if (literal || arg !== "--json") return true;
+    json = true;
+    return false;
+  });
+  return { args: remaining, json };
+}
+
+function parseWaitOptions(args: string[]): Pick<Extract<CliCommand, { type: "wait" }>, "names" | "timeoutMs" | "json"> {
+  const { args: remaining, json } = extractJsonFlag(args);
+  const names: string[] = [];
+  let timeoutMs = DEFAULT_WAIT_TIMEOUT_MS;
+  let literal = false;
+  let timeoutSeen = false;
+  for (let index = 0; index < remaining.length; index += 1) {
+    const arg = remaining[index]!;
+    if (!literal && arg === "--") literal = true;
+    else if (!literal && (arg === "--timeout" || arg.startsWith("--timeout="))) {
+      if (timeoutSeen) throw new Error("Option --timeout may only be specified once.");
+      timeoutSeen = true;
+      const value = arg === "--timeout" ? requireValue(remaining, index, arg) : arg.slice("--timeout=".length);
+      if (arg === "--timeout") index += 1;
+      timeoutMs = /^\d+$/.test(value) ? Number(value) : NaN;
+      validateWaitTimeout(timeoutMs);
+    } else if (!literal && arg.startsWith("-")) throw new Error(`Unknown option "${arg}".`);
+    else names.push(arg);
+  }
+  return { names: [...new Set(names)], timeoutMs, json };
 }
 
 function parseNames(value: string, option: string): string[] {

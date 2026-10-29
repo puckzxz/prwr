@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { isControlEnvelope, PUBLIC_CONTROL_COMMAND_TYPES } from "../src/control-protocol.js";
+import { isControlEnvelope, isSupervisorStatus, PUBLIC_CONTROL_COMMAND_TYPES, sameSupervisorIdentity } from "../src/control-protocol.js";
 import { MAX_LOG_TAIL } from "../src/log-history.js";
-import type { ControlCommand } from "../src/types.js";
+import type { ControlCommand, ProcessRunState, SupervisorIdentity } from "../src/types.js";
+import { processStatusFor, statusFor } from "./helpers/control.js";
 
 describe("control protocol", () => {
   it.each([
@@ -37,5 +38,36 @@ describe("control protocol", () => {
         : type === "send" ? { type, name: "api", text: "rs" } : { type, name: "api" };
       expect(isControlEnvelope({ token: "token", command })).toBe(true);
     }
+  });
+});
+
+describe("status response contract", () => {
+  const states = {
+    starting: true, running: true, stopped: true, restarting: true, failed: true
+  } satisfies Record<ProcessRunState, true>;
+
+  it.each(Object.keys(states) as ProcessRunState[])("accepts the supported %s state", (state) => {
+    expect(isSupervisorStatus(statusFor([processStatusFor("api", { state })]))).toBe(true);
+  });
+
+  it.each([
+    { supervisorPid: process.pid + 1 }, { startedAt: "2026-10-29T13:00:00.000Z" },
+    { projectRoot: "other-project" }, { configPath: "other.yml" }
+  ] satisfies Partial<SupervisorIdentity>[])("rejects changed supervisor identity %j", (change) => {
+    const original = statusFor().supervisor;
+    expect(sameSupervisorIdentity(original, { ...original })).toBe(true);
+    expect(sameSupervisorIdentity(original, { ...original, ...change })).toBe(false);
+  });
+
+  it.each([
+    null, [], {}, { ...statusFor(), supervisor: {} }, { ...statusFor(), processes: [] },
+    statusFor(undefined, { port: 0 }), statusFor(undefined, { port: 65536 }),
+    statusFor([processStatusFor("api"), processStatusFor("api")]),
+    ...[{ state: "unknown" }, { state: "constructor" }, { state: "__proto__" }, { pid: -1 },
+      { restartCount: -1 }, { lastError: 1 }, { lastExitCode: "1" }].map((overrides) => ({
+      ...statusFor(), processes: [{ ...processStatusFor("api"), ...overrides }]
+    }))
+  ])("rejects malformed or ambiguous status %j", (value) => {
+    expect(isSupervisorStatus(value)).toBe(false);
   });
 });

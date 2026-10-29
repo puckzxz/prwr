@@ -108,6 +108,20 @@ export type ControlResponse =
   | { ok: true; data: unknown }
   | { ok: false; error: string };
 
+export interface ProjectCommandOptions {
+  configPath?: string;
+  signal?: AbortSignal;
+}
+
+export interface ControlRequestOptions extends Omit<ProjectCommandOptions, "configPath"> {
+  expectedConfigPath?: string;
+}
+
+export interface ProcessWaitOptions extends ProjectCommandOptions {
+  names: string[];
+  timeoutMs: number;
+}
+
 export interface ControlEnvelope {
   token: string;
   command: ControlCommand;

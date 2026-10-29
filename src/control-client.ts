@@ -3,11 +3,12 @@ import net from "node:net";
 import path from "node:path";
 import { isPidAlive } from "./kill-tree.js";
 import { DEFAULT_MAX_CONTROL_RESPONSE_BYTES } from "./control-server.js";
+import { isSupervisorIdentity, sameSupervisorIdentity } from "./control-protocol.js";
 import type {
   ControlCommand,
   ControlEnvelope,
+  ControlRequestOptions,
   ControlResponse,
-  SupervisorIdentity,
   SupervisorStateFile
 } from "./types.js";
 
@@ -15,6 +16,7 @@ const RUNTIME_DIR_NAME = ".prwr";
 const STATE_FILE_NAME = "supervisor.json";
 const DEFAULT_CONTROL_CLIENT_TIMEOUT_MS = 5000;
 const START_CONTROL_CLIENT_TIMEOUT_MS = 60000;
+export const SUPERVISOR_NOT_RUNNING = "prwr supervisor is not running for this project.";
 
 interface ControlExchange {
   response: ControlResponse;
@@ -86,19 +88,25 @@ function isValidState(value: unknown): value is SupervisorStateFile {
 }
 
 export async function readVerifiedSupervisorState(
-  projectRoot: string
+  projectRoot: string,
+  options: ControlRequestOptions = {}
 ): Promise<SupervisorStateFile | null> {
+  options.signal?.throwIfAborted();
   const state = readSupervisorState(projectRoot);
   if (!state) {
     return null;
   }
 
-  const { response, transportFailed } = await sendControlCommandToState(state, { type: "identity" });
+  if (options.expectedConfigPath && path.relative(options.expectedConfigPath, state.configPath) !== "") {
+    throw new Error(`prwr supervisor is running with a different config: ${state.configPath}`);
+  }
+
+  const { response, transportFailed } = await sendControlCommandToState(state, { type: "identity" }, options.signal);
   if (transportFailed && isPidAlive(state.supervisorPid)) {
     const error = response.ok ? "No identity response." : response.error;
     throw new Error(`Unable to verify prwr supervisor (pid ${state.supervisorPid}): ${error} Existing state has been preserved.`);
   }
-  if (!response.ok || !isSupervisorIdentity(response.data) || !identityMatchesState(response.data, state)) {
+  if (!response.ok || !isSupervisorIdentity(response.data) || !sameSupervisorIdentity(response.data, state)) {
     removeSupervisorState(projectRoot);
     return null;
   }
@@ -108,21 +116,24 @@ export async function readVerifiedSupervisorState(
 
 export async function sendControlCommand(
   projectRoot: string,
-  command: ControlCommand
+  command: ControlCommand,
+  options: ControlRequestOptions = {}
 ): Promise<ControlResponse> {
-  const state = await readVerifiedSupervisorState(projectRoot);
+  const state = await readVerifiedSupervisorState(projectRoot, options);
   if (!state) {
-    return { ok: false, error: "prwr supervisor is not running for this project." };
+    return { ok: false, error: SUPERVISOR_NOT_RUNNING };
   }
 
-  return (await sendControlCommandToState(state, command)).response;
+  return (await sendControlCommandToState(state, command, options.signal)).response;
 }
 
 async function sendControlCommandToState(
   state: SupervisorStateFile,
-  command: ControlCommand
+  command: ControlCommand,
+  signal?: AbortSignal
 ): Promise<ControlExchange> {
-  return new Promise((resolve) => {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host: "127.0.0.1", port: state.port });
     let response = "";
     let responseBytes = 0;
@@ -132,9 +143,19 @@ async function sendControlCommandToState(
       if (!settled) {
         settled = true;
         socket.setTimeout(0);
+        signal?.removeEventListener("abort", onAbort);
         resolve({ response: value, transportFailed });
       }
     };
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      socket.destroy();
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     socket.setEncoding("utf8");
     const timeoutMs = command.type === "start" || command.type === "restart"
@@ -182,27 +203,6 @@ function isControlResponse(value: unknown): value is ControlResponse {
   return isRecord(value) && (
     (value.ok === true && "data" in value) ||
     (value.ok === false && typeof value.error === "string")
-  );
-}
-
-function isSupervisorIdentity(value: unknown): value is SupervisorIdentity {
-  return (
-    isRecord(value) &&
-    typeof value.supervisorPid === "number" &&
-    Number.isInteger(value.supervisorPid) &&
-    value.supervisorPid > 0 &&
-    typeof value.projectRoot === "string" &&
-    typeof value.configPath === "string" &&
-    typeof value.startedAt === "string"
-  );
-}
-
-function identityMatchesState(identity: SupervisorIdentity, state: SupervisorStateFile): boolean {
-  return (
-    identity.supervisorPid === state.supervisorPid &&
-    identity.projectRoot === state.projectRoot &&
-    identity.configPath === state.configPath &&
-    identity.startedAt === state.startedAt
   );
 }
 

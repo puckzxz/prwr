@@ -3,8 +3,9 @@ import path from "node:path";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runCheck, runUp, sendProjectCommand } from "./supervisor.js";
-import { isJsonStatusRequest, parseCliArgs, type CliCommand } from "./cli-args.js";
+import { isJsonRequest, parseCliArgs, type CliCommand } from "./cli-args.js";
 import { printFailure, printJsonStatus, printLogs, printStatus, printUsage } from "./cli-output.js";
+import { waitForProcesses } from "./process-wait.js";
 import type { ProcessLogs, ProcessStatus, SupervisorStatus } from "./types.js";
 
 export { parseCliArgs } from "./cli-args.js";
@@ -14,7 +15,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   try {
     command = parseCliArgs(argv);
   } catch (error) {
-    if (isJsonStatusRequest(argv)) return printFailure(errorMessage(error), true);
+    if (isJsonRequest(argv)) return printFailure(errorMessage(error), true);
     throw error;
   }
 
@@ -47,6 +48,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       });
     case "control":
       return runControl(command);
+    case "wait":
+      return runWait(command);
     default:
       return assertNever(command);
   }
@@ -54,7 +57,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 
 async function runControl(command: Extract<CliCommand, { type: "control" }>): Promise<number> {
   try {
-    const response = await sendProjectCommand(process.cwd(), command.command);
+    const response = command.configPath === undefined
+      ? await sendProjectCommand(process.cwd(), command.command)
+      : await sendProjectCommand(process.cwd(), command.command, { configPath: command.configPath });
     if (!response.ok) return printFailure(response.error, command.json);
 
     if (command.command.type === "status") {
@@ -73,6 +78,24 @@ async function runControl(command: Extract<CliCommand, { type: "control" }>): Pr
   } catch (error) {
     if (command.json) return printFailure(errorMessage(error), true);
     throw error;
+  }
+}
+
+async function runWait(command: Extract<CliCommand, { type: "wait" }>): Promise<number> {
+  const controller = new AbortController();
+  const onSignal = () => controller.abort(new Error("prwr wait interrupted."));
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    const status = await waitForProcesses(process.cwd(), { ...command, signal: controller.signal });
+    if (command.json) printJsonStatus(status);
+    else console.log(`prwr ready: ${(command.names.length ? command.names : status.processes.map(({ name }) => name)).join(", ")}`);
+    return 0;
+  } catch (error) {
+    return printFailure(errorMessage(error), command.json);
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
   }
 }
 

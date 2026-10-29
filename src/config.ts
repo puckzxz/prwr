@@ -36,8 +36,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
     );
   }
 
-  const configPath = path.resolve(options.cwd, selected.path);
-  const configDir = path.dirname(configPath);
+  const { configPath, projectRoot: configDir } = resolveConfigTarget(options.cwd, selected.path);
   const source = readFileSync(configPath, "utf8");
 
   if (selected.kind === "procfile" || isProcfilePath(configPath)) {
@@ -45,6 +44,12 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
   }
 
   return loadYamlConfig(configPath, configDir, source);
+}
+
+// Control commands target the original path without reloading config or env files.
+export function resolveConfigTarget(cwd: string, selectedPath: string): { configPath: string; projectRoot: string } {
+  const configPath = path.resolve(cwd, selectedPath);
+  return { configPath, projectRoot: path.dirname(configPath) };
 }
 
 function selectConfigPath(
